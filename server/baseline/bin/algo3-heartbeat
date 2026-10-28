@@ -17,7 +17,7 @@ setting() {   # setting <KEY>: value from the conf, data only (never sourced)
 url="$(setting BOX_CHECK_URL)"
 limit="$(setting DISK_FAIL_PERCENT)"; limit="${limit:-85}"
 [[ -n "$url" ]] || { echo "BOX_CHECK_URL not set; nothing to ping"; exit 0; }
-[[ "$url" =~ ^https://[A-Za-z0-9./_-]+$ ]] || { echo "BOX_CHECK_URL is not a plain https URL" >&2; exit 1; }
+[[ "$url" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9./_-]*)?$ ]] || { echo "BOX_CHECK_URL is not a plain https URL" >&2; exit 1; }
 
 problems=()
 systemctl is-active --quiet docker || problems+=("docker is not active")

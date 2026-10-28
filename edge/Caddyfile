@@ -1,0 +1,15 @@
+# algo3-edge Caddyfile. Sites are NOT written here: they are files under
+# /etc/algo3/caddy, so a deploy changes one site file and reloads, never this.
+{
+	email {$ACME_EMAIL}
+	# Empty on the server. The lab sets it to `local_certs` (there is no
+	# public DNS there for Let's Encrypt).
+	{$EDGE_LAB_OPTIONS}
+}
+
+# Product sites, one file per app/env, written by algo3-deploy (blue/green).
+# algo3-deploy requires exactly this one line.
+import /etc/algo3/caddy/sites/*.caddy
+
+# studio-platform's sites (auth-<product>, files, mail), once it runs here.
+import /etc/algo3/caddy/platform/*.caddy

@@ -15,6 +15,9 @@ CHECK_DIR=/etc/algo3/caddy/check
 # Public checks go to the edge on this machine (with the real hostname and TLS),
 # not out to the internet and back.
 PUBLIC_CHECK_IP=127.0.0.1
+# The edge's HTTPS port for that check. 443 normally; only a dry-run edge
+# (beside the old host Caddy, during the Phase 3 cutover) uses another port.
+PUBLIC_CHECK_PORT=443
 
 # healthchecks.io check for deploys: pinged on success, /fail on failure.
 # Leave empty until the check exists.

@@ -15,10 +15,16 @@ if "--resolve" not in args:
 
 with open(STATE) as f:
     s = json.load(f)
-host, _, path = url[len("https://"):].partition("/")
-upstream = s.get("routes", {}).get(host)
-c = s["containers"].get(upstream or "")
-if os.environ.get("STUB_PUBLIC_FAIL") or not c or c["status"] != "running":
+hostport, _, path = url[len("https://"):].partition("/")
+host = hostport.split(":")[0]
+with open(os.path.join(os.environ["STUB_DIR"], "public-urls"), "a") as f:
+    f.write(url + "\n")
+# The edge routes a host to an alias (from the last successful reload); Docker
+# DNS answers that alias with whichever RUNNING containers hold it.
+alias = s.get("routes", {}).get(host)
+serving = [c for c in s["containers"].values() if c["status"] == "running" and alias and alias in c.get("aliases", [])]
+c = max(serving, key=lambda x: x["created"]) if serving else None
+if os.environ.get("STUB_PUBLIC_FAIL") or not c:
     sys.exit(22)
 rel = c["labels"].get("algo3.release", "")
 if rel and rel == os.environ.get("STUB_NEVER_READY", ""):

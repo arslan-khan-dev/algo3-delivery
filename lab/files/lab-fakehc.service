@@ -1,0 +1,10 @@
+[Unit]
+Description=lab stand-in for healthchecks.io (https://hc.lab:8443)
+ConditionPathExists=/etc/lab/fakehc.crt
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/lib/lab/fakehc.py /etc/lab/fakehc.crt /etc/lab/fakehc.key
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

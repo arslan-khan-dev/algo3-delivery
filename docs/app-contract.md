@@ -22,6 +22,7 @@ that cannot work, or a failure nobody hears about.
 
 - [ ] Rules 1–10 met. The image's `release.json` matches its commit in the CI smoke test.
 - [ ] `server/apps/<app>/{staging,production}.conf` and `*.caddy.tmpl` added to this repo. Production has `PROMOTE_FROM=staging`.
+      Each template's `reverse_proxy {{UPSTREAM}}` sets `lb_try_duration` and a short `dial_timeout`, copied from the nexwe-website templates. The deployer refuses a template without them, because a deploy moves the alias instead of reloading Caddy, and those settings are what let a request retry the new release.
 - [ ] On the server: `sudo ./install.sh --app <app>`, plus `<env>.env` (root, 0600) if the app needs secrets.
 - [ ] One SSH key **per environment**, added to `~algo3-deploy/.ssh/authorized_keys` as
       `restrict,command="/usr/local/sbin/algo3-deploy-ssh <app> <env>" ssh-ed25519 … ci-<app>-<env>`.

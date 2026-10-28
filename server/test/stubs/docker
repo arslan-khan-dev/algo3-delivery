@@ -131,13 +131,13 @@ def main(argv):
         status = "exited" if labels.get("algo3.release") == flag("EXIT_ON_START") else "running"
         s["containers"][name] = {"id": hashlib.sha1(name.encode()).hexdigest(), "status": status,
                                  "labels": labels, "created": "%.6f" % time.time(), "restarts": 0,
-                                 "image": argv[-1]}
+                                 "image": argv[-1], "aliases": []}
         save(s)
         print(s["containers"][name]["id"])
         return
 
     if cmd in ("start", "stop"):
-        name = argv[1]
+        name = argv[-1]   # `docker stop --time 15 <name>`
         c = s["containers"].get(name)
         if not c:
             fail(f"Error: No such container: {name}")
@@ -145,6 +145,12 @@ def main(argv):
             if c["status"] != "running":
                 c["restarts"] = c.get("restarts", 0) + 1
             c["status"] = "running"
+            # A container that holds a routed alias takes traffic the moment it
+            # starts. If it is not ready, real users would hit it: record that.
+            routed_aliases = set(s.get("routes", {}).values())
+            if set(c.get("aliases", [])) & routed_aliases and not ready(s, name):
+                with open(os.path.join(os.environ["STUB_DIR"], "violations"), "a") as f:
+                    f.write(f"{name} started holding a live alias while not ready\n")
         else:
             c["status"] = "exited"
         save(s)
@@ -164,6 +170,19 @@ def main(argv):
         return
 
     if cmd == "network":
+        # `network connect [--alias A] NET C` / `network disconnect [--force] NET C`.
+        # Only the edge network's aliases matter to routing; like real Docker,
+        # a stopped container keeps its alias but answers nothing.
+        sub, rest = argv[1], argv[2:]
+        name = rest[-1]
+        c = s["containers"].get(name)
+        if not c:
+            fail(f"Error: No such container: {name}")
+        if sub == "disconnect":
+            c["aliases"] = []
+        elif sub == "connect" and "--alias" in rest:
+            c["aliases"] = [rest[rest.index("--alias") + 1]]
+        save(s)
         return
 
     if cmd == "exec":

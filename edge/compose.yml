@@ -1,0 +1,56 @@
+# algo3-edge — the server's single front door. Installed to /opt/algo3/edge:
+#   sudo docker compose -p algo3-edge -f /opt/algo3/edge/compose.yml up -d
+#
+# One Caddy container that holds every HTTPS certificate and routes each site
+# to its live container BY NAME on the shared `studio` network. Sites are files
+# under /etc/algo3/caddy: sites/ is written by algo3-deploy on every deploy,
+# platform/ is for studio-platform's sites later. Restarting or upgrading any
+# product, or the platform, never touches this container.
+name: algo3-edge
+
+services:
+  studio-caddy:
+    # Same Caddy as the host Caddy it replaces (v2.11.7), alpine for the wget
+    # that algo3-deploy uses to check releases from inside the edge. Pinned by
+    # digest: what was rehearsed is what runs.
+    image: caddy:2.11.7-alpine@sha256:eb4d35b7452d1ab6171fbdbe8d9275b2301dad6dad92115d91e19fb9b24d510f
+    container_name: studio-caddy
+    restart: unless-stopped
+    mem_limit: 256m
+    env_file: .env
+    ports:
+      # 80/443 normally. During the Phase 3 dry run, .env moves them to
+      # 18080/18443 so the edge can be proven beside the old host Caddy.
+      - '${EDGE_HTTP_PORT:-80}:80'
+      - '${EDGE_HTTPS_PORT:-443}:443'
+      - '${EDGE_HTTPS_PORT:-443}:443/udp' # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Same path as on the host, read-only: the file algo3-deploy validates
+      # and writes is the file Caddy reads; only root on the host changes it.
+      - /etc/algo3/caddy:/etc/algo3/caddy:ro
+      - data:/data
+      - config:/config
+    networks: [studio]
+    labels:
+      autoheal: 'true'
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '-O', '/dev/null', 'http://127.0.0.1:2019/config/']
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+networks:
+  # Created once with `docker network create studio`; every project joins it
+  # as external, so no single project owns (or can delete) it.
+  studio:
+    external: true
+
+volumes:
+  # Certificates and the ACME account. Back this up: losing it means
+  # re-issuing every certificate at once.
+  data:
+    name: algo3-edge-data
+  config:
+    name: algo3-edge-config

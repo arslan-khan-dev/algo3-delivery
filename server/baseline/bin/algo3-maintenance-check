@@ -14,7 +14,7 @@ setting() {
 
 url="$(setting MAINTENANCE_CHECK_URL)"
 [[ -n "$url" ]] || { echo "MAINTENANCE_CHECK_URL not set; nothing to ping"; exit 0; }
-[[ "$url" =~ ^https://[A-Za-z0-9./_-]+$ ]] || { echo "MAINTENANCE_CHECK_URL is not a plain https URL" >&2; exit 1; }
+[[ "$url" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9./_-]*)?$ ]] || { echo "MAINTENANCE_CHECK_URL is not a plain https URL" >&2; exit 1; }
 
 if [[ -e "$FLAG" ]]; then
     packages="$(tr '\n' ' ' < "$FLAG.pkgs" 2>/dev/null || true)"

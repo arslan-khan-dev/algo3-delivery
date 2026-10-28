@@ -11,7 +11,8 @@ merge → main ─► promote: find the staging deploy with the same git tree
 server: ssh (key pinned to one app/env) ─► algo3-deploy-ssh ─► sudo algo3-deploy-wrapper
         ─► systemd unit (survives SSH loss) ─► algo3-deploy:
            pull by digest → start <app>-<env>-<sha12> → health + release marker via the edge
-           → caddy validate → switch the route → public check → keep one rollback
+           → give it the stable alias <app>-<env> → stop the old release gracefully
+           → public check → keep one rollback   (Caddy is NOT reloaded on a deploy)
 ```
 
 - **Deploys are automatic.** Pushing or merging to `staging` deploys staging. Merging to `main` deploys production.
@@ -30,6 +31,9 @@ server: ssh (key pinned to one app/env) ─► algo3-deploy-ssh ─► sudo algo
 | `server/install.sh` | Idempotent installer (`--app <name>` for a registry entry) |
 | `server/apps/<app>/` | Per-app registry: `<env>.conf` and `<env>.caddy.tmpl` |
 | `server/test/run.sh` | The test suite. It fakes docker and curl and covers every failure path |
+| `edge/` | `algo3-edge`, the single Caddy container on 80/443, its installer, and `CUTOVER.md` |
+| `docs/rollout-nexwe-website.md` | Phase 4: GitHub settings, deploy keys, the first automatic deploys |
+| `lab/` | A local stand-in for the VPS. Every server step is rehearsed there first (see `lab/README.md`) |
 | `server/baseline/baseline.sh` | Server baseline, one component at a time: `sysctl`, `apt`, `docker`, `timers`, `ops`, `ssh` |
 | `server/baseline/ops/` | autoheal (restarts unhealthy containers) + Netdata (alerts to Telegram), pinned by digest |
 | `server/baseline/bin/` | Heartbeat to healthchecks.io (every 5 min), pending-reboot alert (daily), image prune (weekly; never containers) |

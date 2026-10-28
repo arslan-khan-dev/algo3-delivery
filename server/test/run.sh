@@ -37,7 +37,15 @@ reset() {
 deploy()   { /usr/local/libexec/algo3-deploy deploy "$APP" "$@" >"$STUB_DIR/out" 2>&1; }
 rollback() { /usr/local/libexec/algo3-deploy rollback "$APP" "$1" >"$STUB_DIR/out" 2>&1; }
 
-routed()   { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("routes",{}).get(sys.argv[2],""))' "$STUB_DIR/state.json" "$1"; }
+# The container(s) actually answering a hostname: the edge routes the host to an
+# alias; Docker DNS answers the alias with every RUNNING container holding it.
+routed()   { python3 -c '
+import json, sys
+s = json.load(open(sys.argv[1]))
+alias = s.get("routes", {}).get(sys.argv[2], "")
+print("+".join(sorted(n for n, c in s["containers"].items() if c["status"] == "running" and alias and alias in c.get("aliases", []))))
+' "$STUB_DIR/state.json" "$1"; }
+reloads()  { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("counters",{}).get("reload",0))' "$STUB_DIR/state.json"; }
 status_of(){ python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["containers"].get(sys.argv[2]); print(c["status"] if c else "absent")' "$STUB_DIR/state.json" "$1"; }
 n_containers(){ python3 -c 'import json,sys; print(sum(1 for c in json.load(open(sys.argv[1]))["containers"].values() if c["labels"].get("algo3.env")==sys.argv[2]))' "$STUB_DIR/state.json" "$1"; }
 
@@ -56,7 +64,59 @@ ok eq "$(routed staging.nexwe.app)" "$S-${A:0:12}"
 ok has /var/lib/algo3/$APP/staging.history "$A $(digest "$A")"
 ok has /var/log/algo3/deploys.log "action=deploy app=$APP env=staging result=ok"
 ok eq "$(cat "$STUB_DIR/heartbeats")" "https://hc.example/ping/deploys"
-ok eq "$(head -1 /etc/algo3/caddy/sites/$APP-staging.caddy)" "# algo3: app=$APP env=staging upstream=$S-${A:0:12} release=$A"
+ok eq "$(head -1 /etc/algo3/caddy/sites/$APP-staging.caddy)" "# algo3: app=$APP env=staging upstream=$S"
+ok grep -q "reverse_proxy $S:80" /etc/algo3/caddy/sites/$APP-staging.caddy
+ok eq "$(cat /var/lib/algo3/$APP/staging.live)" "$S-${A:0:12}"
+
+reset "a normal deploy never reloads the edge (only the first one does)"
+deploy staging "$A"
+ok eq "$(reloads)" 1
+ok deploy staging "$B"
+ok deploy staging "$C"
+ok eq "$(reloads)" 1
+ok eq "$(routed staging.nexwe.app)" "$S-${C:0:12}"
+
+reset "a release holds the alias only once it passed its checks"
+deploy staging "$A"
+export STUB_WRONG_MARKER="$B"
+ok no deploy staging "$B"
+unset STUB_WRONG_MARKER
+ok eq "$(routed staging.nexwe.app)" "$S-${A:0:12}"
+
+reset "a template change is validated, then reloaded exactly once"
+deploy staging "$A"
+sed -i 's/encode zstd gzip/encode gzip/' /etc/algo3/apps/$APP/staging.caddy.tmpl
+ok deploy staging "$B"
+ok eq "$(reloads)" 2
+ok grep -q "encode gzip$" /etc/algo3/caddy/sites/$APP-staging.caddy
+ok eq "$(routed staging.nexwe.app)" "$S-${B:0:12}"
+
+reset "a template the edge rejects is refused; the old site and release stay"
+deploy staging "$A"
+cp /etc/algo3/caddy/sites/$APP-staging.caddy /tmp/site-before
+sed -i 's/encode zstd gzip/encode gzip/' /etc/algo3/apps/$APP/staging.caddy.tmpl
+export STUB_VALIDATE_FAIL=1
+ok no deploy staging "$B"
+unset STUB_VALIDATE_FAIL
+ok cmp -s /tmp/site-before /etc/algo3/caddy/sites/$APP-staging.caddy
+ok eq "$(routed staging.nexwe.app)" "$S-${A:0:12}"
+ok eq "$(status_of "$S-${B:0:12}")" absent
+
+reset "an edge reload that fails on a template change is rolled back"
+deploy staging "$A"
+cp /etc/algo3/caddy/sites/$APP-staging.caddy /tmp/site-before
+sed -i 's/encode zstd gzip/encode gzip/' /etc/algo3/apps/$APP/staging.caddy.tmpl
+export STUB_RELOAD_FAIL=2   # reload 1 was the first deploy
+ok no deploy staging "$B"
+unset STUB_RELOAD_FAIL
+ok cmp -s /tmp/site-before /etc/algo3/caddy/sites/$APP-staging.caddy
+ok eq "$(routed staging.nexwe.app)" "$S-${A:0:12}"
+ok eq "$(status_of "$S-${B:0:12}")" absent
+
+reset "a template without retry settings is refused"
+sed -i '/lb_try_duration/d' /etc/algo3/apps/$APP/staging.caddy.tmpl
+ok no deploy staging "$A"
+ok has "$STUB_DIR/out" "must set lb_try_duration and dial_timeout"
 
 reset "second deploy keeps one rollback, third removes the oldest"
 deploy staging "$A"; ok deploy staging "$B"
@@ -98,17 +158,26 @@ ok eq "$(routed staging.nexwe.app)" "$S-${B:0:12}"
 ok rollback staging
 ok eq "$(routed staging.nexwe.app)" "$S-${A:0:12}"
 
+reset "a retained release takes no traffic until it passes its checks again"
+deploy staging "$A"; deploy staging "$B"
+export STUB_NEVER_READY="$A"
+ok no deploy staging "$A"
+unset STUB_NEVER_READY
+ok eq "$(cat "$STUB_DIR/violations" 2>/dev/null)" ""
+ok eq "$(routed staging.nexwe.app)" "$S-${B:0:12}"
+ok eq "$(status_of "$S-${A:0:12}")" exited
+
 reset "rollback with nothing retained is refused"
 deploy staging "$A"
 ok no rollback staging
 ok eq "$(routed staging.nexwe.app)" "$S-${A:0:12}"
 
 # ── Failures before the switch: live release untouched, candidate removed ─────
-for case in PULL_FAIL EXIT_ON_START NEVER_READY UNHEALTHY WRONG_MARKER VALIDATE_FAIL TAG_DIGEST; do
+for case in PULL_FAIL EXIT_ON_START NEVER_READY UNHEALTHY WRONG_MARKER TAG_DIGEST; do
     reset "fails before switch: $case"
     deploy staging "$A"; rm -f "$STUB_DIR/heartbeats"
     case "$case" in
-        PULL_FAIL|VALIDATE_FAIL) export "STUB_$case=1" ;;
+        PULL_FAIL) export "STUB_$case=1" ;;
         TAG_DIGEST) STUB_TAG_DIGEST="$(digest other)"; export STUB_TAG_DIGEST ;;
         *) export "STUB_$case=$B" ;;
     esac
@@ -121,19 +190,19 @@ for case in PULL_FAIL EXIT_ON_START NEVER_READY UNHEALTHY WRONG_MARKER VALIDATE_
     ok eq "$(cat "$STUB_DIR/heartbeats")" "https://hc.example/ping/deploys/fail"
 done
 
-# ── Failures after the switch: route restored, previous serving ──────────────
-for case in RELOAD_FAIL PUBLIC_WRONG; do
+# ── Failures after the switch (alias moved, old release stopped): restored ───
+for case in PUBLIC_FAIL PUBLIC_WRONG; do
     reset "fails after switch: $case"
     deploy staging "$A"
     export "STUB_$case=1"
-    [[ "$case" == RELOAD_FAIL ]] && export STUB_RELOAD_FAIL=2   # 1 = first deploy's reload
     ok no deploy staging "$B"
     unset "STUB_$case"
     ok eq "$(routed staging.nexwe.app)" "$S-${A:0:12}"
     ok eq "$(status_of "$S-${A:0:12}")" running
     ok eq "$(status_of "$S-${B:0:12}")" absent
-    ok has "$STUB_DIR/out" "Route restored"
-    ok eq "$(head -1 /etc/algo3/caddy/sites/$APP-staging.caddy | grep -o 'upstream=[^ ]*')" "upstream=$S-${A:0:12}"
+    ok has "$STUB_DIR/out" "serving again"
+    ok eq "$(reloads)" 1
+    ok eq "$(cat /var/lib/algo3/$APP/staging.live)" "$S-${A:0:12}"
 done
 
 reset "previous release is broken too: keep the new route, flag for a human"
@@ -197,6 +266,19 @@ ok no bash -c "printf '%s\n' $B | $SSH $APP" >/dev/null 2>&1
 ok no bash -c "printf '%s\n' 'rm -rf /' | $SSH $APP staging" >/dev/null 2>&1
 ok bash -c "SSH_ORIGINAL_COMMAND='bash -i' printf '%s\n' $B | $SSH $APP staging" >/dev/null 2>&1
 ok eq "$(routed staging.nexwe.app)" "$S-${B:0:12}"
+
+reset "public check uses 443 by default"
+ok deploy staging "$A"
+ok grep -q "^https://staging.nexwe.app:443/" "$STUB_DIR/public-urls"
+
+reset "public check follows PUBLIC_CHECK_PORT (the dry-run edge)"
+sed -i 's/^PUBLIC_CHECK_PORT=.*/PUBLIC_CHECK_PORT=18443/' /etc/algo3/delivery.conf
+ok deploy staging "$A"
+ok grep -q "^https://staging.nexwe.app:18443/release.json" "$STUB_DIR/public-urls"
+ok no grep -q ":443/" "$STUB_DIR/public-urls"
+sed -i 's/^PUBLIC_CHECK_PORT=.*/PUBLIC_CHECK_PORT=443x/' /etc/algo3/delivery.conf
+ok no deploy staging "$B"
+ok has "$STUB_DIR/out" "Invalid PUBLIC_CHECK_PORT"
 
 reset "conf files are data, not code"
 # shellcheck disable=SC2016 # the literal $(...) is the point: it must NOT run

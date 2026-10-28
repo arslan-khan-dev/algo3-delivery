@@ -36,10 +36,16 @@ if IFS= read -r -t 2 _; then die "Unexpected additional input"; fi
 [[ -f "$APPS/$app/$env.conf" ]] || die "$app/$env is not registered on this server"
 [[ -x "$DEPLOY" ]] || die "Deployer not installed"
 
-unit="algo3-deploy-$app-$env-$(date +%s)"
+# Seconds alone would collide when two deploys start in the same second; the
+# deployer's own lock must be what refuses the second one, not a unit name.
+unit="algo3-deploy-$app-$env-$(date +%s)-$$"
 printf 'Deploy unit: %s\n' "$unit"
 
-journalctl --follow --lines=0 --output=cat --unit "$unit" &
+# Follow from the start time, not from "now": a deploy that is refused at once
+# (e.g. by the lock) logs its reason before a --lines=0 follower attaches, and
+# the caller would see only "failed" with no reason.
+started="$(date +%s)"
+journalctl --follow --since "@$started" --output=cat --unit "$unit" &
 follower=$!
 
 rc=0

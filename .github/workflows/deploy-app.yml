@@ -220,7 +220,7 @@ jobs:
           printf '%s\n' "$KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
           printf '%s\n%s\n' "$SHA" "$DIGEST" |
-            ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes \
+            ssh -T -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes \
                 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
                 -o ServerAliveInterval=15 -o ConnectTimeout=20 \
                 "algo3-deploy@$HOST"

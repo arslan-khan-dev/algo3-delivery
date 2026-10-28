@@ -6,15 +6,26 @@
 #   algo3-deploy status   <app> <env>
 #
 # Runs as root, normally through algo3-deploy-wrapper (CI) or `sudo` (admin).
-# Generalised from the proven /usr/local/libexec/deploy-nexwe. The one design
-# change: containers are NAMED after their release and never renamed. The edge
-# (the studio-caddy container) reaches them by name on the docker network, so a
-# switch is "rewrite one site file, reload", and recovery never has to repair a
-# half-finished rename.
+# Generalised from the proven /usr/local/libexec/deploy-nexwe.
+#
+# How a release goes live — WITHOUT reloading the edge:
+#   Each release runs as its own container, <app>-<env>-<sha12>, never renamed.
+#   The edge's site file points at a STABLE name, <app>-<env>, which is a
+#   docker network alias. A new release starts without the alias, is checked
+#   by name (health + release marker), then takes the alias; the old release
+#   is stopped gracefully, which removes it from DNS. Caddy re-resolves the
+#   name per connection, retries a failed dial (lb_try_duration, short
+#   dial_timeout), and its configuration never changes.
+#   Why: measured in the lab (2026-10-29), every Caddy reload drops roughly
+#   one new connection in three — on EVERY site, not just the one deployed.
+#   Moving the alias dropped none in 20 switches. The edge is reloaded only
+#   when an app's site template changes (or on its first deploy).
 #
 # Every app/env is registered under /etc/algo3/apps/<app>/:
 #   <env>.conf          KEY=value settings (see examples/), root-owned
-#   <env>.caddy.tmpl    the site block, with {{UPSTREAM}} where the route goes
+#   <env>.caddy.tmpl    the site block; {{UPSTREAM}} becomes <app>-<env>:<port>;
+#                       its reverse_proxy MUST set lb_try_duration and a short
+#                       dial_timeout (see the nexwe-website templates)
 #   <env>.env           optional runtime secrets, root 0600, never sent by CI
 #
 # Retention: exactly one previous release is kept, stopped, as the rollback.
@@ -60,15 +71,17 @@ require_match() {
 
 load_delivery_conf() {
     read_conf "$ETC/delivery.conf" EDGE_CONTAINER EDGE_MAIN_CONFIG SITES_DIR CHECK_DIR \
-        PUBLIC_CHECK_IP HEARTBEAT_URL
+        PUBLIC_CHECK_IP PUBLIC_CHECK_PORT HEARTBEAT_URL
     EDGE="$(conf EDGE_CONTAINER studio-caddy)"
     EDGE_MAIN="$(conf EDGE_MAIN_CONFIG /etc/caddy/Caddyfile)"
     SITES_DIR="$(conf SITES_DIR /etc/algo3/caddy/sites)"
     CHECK_DIR="$(conf CHECK_DIR /etc/algo3/caddy/check)"
     PUBLIC_IP="$(conf PUBLIC_CHECK_IP 127.0.0.1)"
+    PUBLIC_PORT="$(conf PUBLIC_CHECK_PORT 443)"
     HEARTBEAT="$(conf HEARTBEAT_URL)"
     require_match EDGE_CONTAINER "$EDGE" '^[a-z0-9][a-z0-9_.-]*$'
     require_match PUBLIC_CHECK_IP "$PUBLIC_IP" '^[0-9.]+$'
+    require_match PUBLIC_CHECK_PORT "$PUBLIC_PORT" '^[0-9]{2,5}$'
 }
 
 load_app_conf() {
@@ -91,7 +104,7 @@ load_app_conf() {
     PROMOTE_FROM="$(conf PROMOTE_FROM)"
     ATTEMPTS="$(conf HEALTH_ATTEMPTS 30)"
 
-    require_match IMAGE "$IMAGE" '^[a-z0-9][a-z0-9./_-]*$'
+    require_match IMAGE "$IMAGE" '^[a-z0-9][a-z0-9.-]*(:[0-9]{1,5})?(/[a-z0-9._-]+)+$'
     require_match CONTAINER_PORT "$PORT" '^[0-9]{2,5}$'
     require_match HEALTH_PATH "$HEALTH_PATH" '^/[A-Za-z0-9._/-]*$'
     require_match RELEASE_PATH "$RELEASE_PATH" '^/[A-Za-z0-9._/-]*$'
@@ -110,8 +123,15 @@ load_app_conf() {
     ENV_FILE="$dir/$ENV_NAME.env"
     SITE_FILE="$SITES_DIR/$APP-$ENV_NAME.caddy"
     BASE="$APP-$ENV_NAME"
+    NET="${NETWORKS%%,*}"
     [[ -f "$TEMPLATE" ]] || die "Missing site template: $TEMPLATE"
     [[ "$(grep -c '{{UPSTREAM}}' "$TEMPLATE")" -ge 1 ]] || die "Template has no {{UPSTREAM}}: $TEMPLATE"
+    # Without these, a request that resolves the alias to a release that is
+    # just stopping hangs until a long default timeout instead of retrying the
+    # new release within milliseconds.
+    if ! grep -q 'lb_try_duration' "$TEMPLATE" || ! grep -q 'dial_timeout' "$TEMPLATE"; then
+        die "Template's reverse_proxy must set lb_try_duration and dial_timeout: $TEMPLATE"
+    fi
 }
 
 # ── Docker helpers ───────────────────────────────────────────────────────────
@@ -131,6 +151,18 @@ app_containers() {
     done | sort -r | awk '{print $2}'
 }
 
+# Give or take the stable alias <app>-<env> on the edge network. Docker can
+# only change an alias by reconnecting, so this is a disconnect + connect —
+# done only while the container is NOT serving under that alias.
+set_alias() {   # set_alias <container> on|off
+    docker network disconnect --force "$NET" "$1" >/dev/null 2>&1 || true
+    if [[ "$2" == on ]]; then
+        docker network connect --alias "$BASE" "$NET" "$1"
+    else
+        docker network connect "$NET" "$1"
+    fi
+}
+
 edge_fetch() {   # edge_fetch <container> <path> → body on stdout
     docker exec "$EDGE" wget -q -O - -T 5 "http://$1:$PORT$2" 2>/dev/null
 }
@@ -146,21 +178,36 @@ sys.exit(0 if isinstance(data, dict) and data.get(sys.argv[1]) == sys.argv[2] el
 ' "$1" "$2"
 }
 
-# ── Edge (Caddy container) ───────────────────────────────────────────────────
+# ── State: which release is live ─────────────────────────────────────────────
 
-# The live route is recorded on the first line of the site file this tool
-# writes, so the deployer never has to parse Caddy syntax.
-current_upstream() {
-    [[ -f "$SITE_FILE" ]] || return 0
-    sed -nE '1s/^# algo3: app=[^ ]+ env=[^ ]+ upstream=([a-z0-9._-]+) release=[0-9a-f]{40}$/\1/p' "$SITE_FILE"
+live_file() { printf '%s/%s/%s.live' "$STATE" "$APP" "$ENV_NAME"; }
+
+live_container() {   # the live release's container, if it still exists
+    local file name
+    file="$(live_file)"
+    [[ -f "$file" ]] || return 0
+    name="$(head -1 "$file")"
+    [[ "$name" =~ ^[a-z0-9][a-z0-9_.-]*$ ]] || return 0
+    c_exists "$name" && printf '%s' "$name"
+    return 0
 }
 
-render_site() {   # render_site <container> <sha> <dest>
+set_live() {   # set_live <container>
+    mkdir -p "$STATE/$APP"
+    printf '%s\n' "$1" > "$(live_file).new"
+    mv -f "$(live_file).new" "$(live_file)"
+}
+
+# ── Edge (Caddy container) ───────────────────────────────────────────────────
+# The site file points at the stable alias, so it only changes when the
+# template does. Most deploys never touch it, and never reload the edge.
+
+render_site() {   # render_site <dest>
     {
-        printf '# algo3: app=%s env=%s upstream=%s release=%s\n' "$APP" "$ENV_NAME" "$1" "$2"
-        printf '# Written by algo3-deploy. Do not edit: the next deploy replaces it.\n'
-        sed "s/{{UPSTREAM}}/$1:$PORT/g" "$TEMPLATE"
-    } > "$3"
+        printf '# algo3: app=%s env=%s upstream=%s\n' "$APP" "$ENV_NAME" "$BASE"
+        printf '# Written by algo3-deploy from %s. Edit the template, not this file.\n' "$TEMPLATE"
+        sed "s/{{UPSTREAM}}/$BASE:$PORT/g" "$TEMPLATE"
+    } > "$1"
 }
 
 validate_with() {   # validate_with <candidate site file>
@@ -188,9 +235,32 @@ reload_edge() {
     docker exec "$EDGE" caddy reload --config "$EDGE_MAIN" --adapter caddyfile
 }
 
-install_site() {   # install_site <file>: atomic replace
-    install -m 0644 "$1" "$SITE_FILE.new"
+ensure_site() {   # write + validate + reload, only if the rendered site changed
+    local candidate
+    candidate="$(mktemp "$CHECK_DIR/site.XXXXXX")"
+    render_site "$candidate"
+    if [[ -f "$SITE_FILE" ]] && cmp -s "$candidate" "$SITE_FILE"; then
+        rm -f "$candidate"
+        return 0
+    fi
+    if ! validate_with "$candidate"; then
+        rm -f "$candidate"
+        die "Edge rejected the site configuration rendered from $TEMPLATE"
+    fi
+    # One edge, many apps: serialise configuration changes across all of them.
+    exec 8>"$LOCK_DIR/edge.lock"
+    flock -w 120 8 || die "Timed out waiting for the edge lock"
+    if [[ -f "$SITE_FILE" ]]; then
+        SITE_BACKUP="$(mktemp "$CHECK_DIR/backup.XXXXXX")"
+        cp -p "$SITE_FILE" "$SITE_BACKUP"
+    fi
+    SITE_CHANGED=true
+    install -m 0644 "$candidate" "$SITE_FILE.new"
     mv -f "$SITE_FILE.new" "$SITE_FILE"
+    rm -f "$candidate"
+    log "Site configuration changed; reloading the edge"
+    reload_edge >/dev/null || die "Edge reload failed"
+    flock -u 8
 }
 
 # ── Checks ───────────────────────────────────────────────────────────────────
@@ -225,11 +295,11 @@ marker_matches() {   # marker_matches <container> <sha>
 public_serves() {   # public_serves <sha>: through the real edge, TLS included
     local sha="$1" i
     for ((i = 1; i <= ATTEMPTS; i++)); do
-        if curl --fail --silent --max-time 5 --resolve "$HOSTNAME_PUBLIC:443:$PUBLIC_IP" \
-                "https://$HOSTNAME_PUBLIC$PUBLIC_PATH" >/dev/null 2>&1 &&
-           curl --fail --silent --max-time 5 --resolve "$HOSTNAME_PUBLIC:443:$PUBLIC_IP" \
+        if curl --fail --silent --max-time 5 --resolve "$HOSTNAME_PUBLIC:$PUBLIC_PORT:$PUBLIC_IP" \
+                "https://$HOSTNAME_PUBLIC:$PUBLIC_PORT$PUBLIC_PATH" >/dev/null 2>&1 &&
+           curl --fail --silent --max-time 5 --resolve "$HOSTNAME_PUBLIC:$PUBLIC_PORT:$PUBLIC_IP" \
                 --header 'Cache-Control: no-cache' \
-                "https://$HOSTNAME_PUBLIC$RELEASE_PATH" 2>/dev/null |
+                "https://$HOSTNAME_PUBLIC:$PUBLIC_PORT$RELEASE_PATH" 2>/dev/null |
                 json_key_equals "$RELEASE_KEY" "$sha"; then
             return 0
         fi
@@ -265,12 +335,14 @@ heartbeat() {   # heartbeat ok|fail
 }
 
 # ── The switch, shared by deploy and rollback ────────────────────────────────
-# State the EXIT trap reads. Everything the trap needs is a variable set BEFORE
-# the action it describes, so an interruption between "docker did it" and "we
-# noted it" errs on the side of attempting recovery.
+# State the EXIT trap reads. Each flag is set BEFORE the action it describes,
+# so an interruption between "docker did it" and "we noted it" errs on the
+# side of attempting recovery.
 
 TARGET=""; TARGET_SHA=""; TARGET_DIGEST=""; TARGET_WAS_NEW=false
-PREVIOUS=""; SITE_BACKUP=""; ROUTE_CHANGED=false; ACTION=""; DONE=false
+PREVIOUS=""; SITE_BACKUP=""; SITE_CHANGED=false
+PREVIOUS_STOPPED=false # the previous release has been stopped by this run
+ACTION=""; DONE=false
 
 recover() {
     local rc=$?
@@ -282,38 +354,38 @@ recover() {
     log "$ACTION failed; recovering"
     local restored=true
 
-    if [[ "$ROUTE_CHANGED" == true ]]; then
+    if [[ "$PREVIOUS_STOPPED" == true ]]; then
+        # The old release had stopped serving: it must be back BEFORE the
+        # target is taken away, or nothing answers at all.
         restored=false
         if [[ -n "$PREVIOUS" ]] && c_exists "$PREVIOUS"; then
-            if [[ "$(c_status "$PREVIOUS")" != "running" ]]; then
-                docker start "$PREVIOUS" >/dev/null 2>&1 || log "CRITICAL: could not start $PREVIOUS"
-            fi
+            docker start "$PREVIOUS" >/dev/null 2>&1 || log "CRITICAL: could not start $PREVIOUS"
             if wait_ready "$PREVIOUS"; then
-                if cp -p "$SITE_BACKUP" "$SITE_FILE.restore" && mv -f "$SITE_FILE.restore" "$SITE_FILE" &&
-                   reload_edge >/dev/null; then
-                    restored=true
-                    log "Route restored to $PREVIOUS"
-                else
-                    log "CRITICAL: could not restore the route to $PREVIOUS; manual recovery required"
-                fi
+                restored=true
+                log "Previous release $PREVIOUS serving again"
             else
-                log "CRITICAL: previous release $PREVIOUS is not healthy; leaving the route on $TARGET"
+                log "CRITICAL: previous release $PREVIOUS is not healthy; leaving $TARGET serving"
             fi
-        elif [[ -z "$PREVIOUS" ]]; then
-            # First deploy of this app/env: nothing to go back to. Take the
-            # site down rather than route to a release that failed checks.
-            rm -f "$SITE_FILE"
-            reload_edge >/dev/null 2>&1 || log "CRITICAL: edge reload failed while removing $SITE_FILE"
-            restored=true
-            log "First deploy failed; site removed"
         else
-            log "CRITICAL: previous release $PREVIOUS no longer exists; leaving the route on $TARGET"
+            log "CRITICAL: previous release ${PREVIOUS:-?} no longer exists; leaving $TARGET serving"
         fi
     fi
 
-    # The target is cleaned up only when traffic is confirmed elsewhere. A
+    if [[ "$SITE_CHANGED" == true && "$restored" == true ]]; then
+        if [[ -n "$SITE_BACKUP" ]]; then
+            cp -p "$SITE_BACKUP" "$SITE_FILE.restore" && mv -f "$SITE_FILE.restore" "$SITE_FILE"
+        else
+            # First deploy of this app/env: there was no site before.
+            rm -f "$SITE_FILE"
+        fi
+        reload_edge >/dev/null 2>&1 || { restored=false; log "CRITICAL: edge reload failed while restoring $SITE_FILE"; }
+        [[ "$restored" == true ]] && log "Site configuration restored"
+    fi
+
+    # The target is taken out only when traffic is confirmed elsewhere. A
     # reused rollback container is stopped, never removed: it is still the
-    # retained release.
+    # retained release (it keeps its alias, as a stopped container answers
+    # nothing).
     if [[ -n "$TARGET" ]] && c_exists "$TARGET" && [[ "$TARGET" != "$PREVIOUS" ]]; then
         if [[ "$restored" == true ]]; then
             if [[ "$TARGET_WAS_NEW" == true ]]; then
@@ -322,7 +394,7 @@ recover() {
                 docker stop "$TARGET" >/dev/null 2>&1 || true
             fi
         else
-            log "Keeping $TARGET because traffic recovery is not confirmed"
+            log "Keeping $TARGET serving because recovery is not confirmed"
         fi
     fi
 
@@ -333,44 +405,64 @@ recover() {
     exit "$rc"
 }
 
-switch_to() {   # switch_to <container> <sha>: target is running; make it live
-    local target="$1" sha="$2" candidate_site
+make_live() {   # make_live <container> <sha>: target is running WITHOUT the alias
+    local target="$1" sha="$2"
     wait_ready "$target" || die "$target failed its readiness check"
     marker_matches "$target" "$sha" || die "$target does not report release $sha at $RELEASE_PATH"
 
-    candidate_site="$(mktemp "$CHECK_DIR/site.XXXXXX")"
-    render_site "$target" "$sha" "$candidate_site"
-    if ! validate_with "$candidate_site"; then
-        rm -f "$candidate_site"
-        die "Edge rejected the candidate configuration"
-    fi
+    # From here the target receives traffic alongside the previous release.
+    set_alias "$target" on || die "Could not give $target the alias $BASE"
+    ensure_site
 
-    # One edge, many apps: serialise the route change across all of them.
-    exec 8>"$LOCK_DIR/edge.lock"
-    flock -w 120 8 || die "Timed out waiting for the edge lock"
-    if [[ -f "$SITE_FILE" ]]; then
-        SITE_BACKUP="$(mktemp "$CHECK_DIR/backup.XXXXXX")"
-        cp -p "$SITE_FILE" "$SITE_BACKUP"
+    if [[ -n "$PREVIOUS" && "$PREVIOUS" != "$target" ]]; then
+        # Set even when the previous release had already stopped (crashed):
+        # recovery must then bring IT back before taking the target away,
+        # rather than leave nothing serving.
+        PREVIOUS_STOPPED=true
+        if [[ "$(c_status "$PREVIOUS")" == "running" ]]; then
+            # Graceful: in-flight requests finish; the stop removes it from DNS.
+            docker stop --time 15 "$PREVIOUS" >/dev/null || log "WARNING: could not stop $PREVIOUS"
+        fi
     fi
-    ROUTE_CHANGED=true
-    install_site "$candidate_site"
-    rm -f "$candidate_site"
-    reload_edge >/dev/null || die "Edge reload failed"
-    flock -u 8
 
     public_serves "$sha" || die "https://$HOSTNAME_PUBLIC does not serve release $sha"
+    set_live "$target"
 }
 
-retire() {   # stop the old live release; keep exactly one rollback
+retire() {   # keep exactly one rollback: remove everything but live + previous
     local keep="$1" name
-    if [[ -n "$PREVIOUS" && "$PREVIOUS" != "$TARGET" ]] && c_exists "$PREVIOUS"; then
-        docker stop "$PREVIOUS" >/dev/null || log "WARNING: could not stop $PREVIOUS"
-    fi
     while IFS= read -r name; do
         [[ -z "$name" || "$name" == "$TARGET" || "$name" == "$keep" ]] && continue
         log "Removing release older than the retained rollback: $name"
         docker rm -f "$name" >/dev/null || log "WARNING: could not remove $name"
     done < <(app_containers)
+}
+
+start_release() {   # create the target container, without the alias
+    local sha="$1" digest="$2" path net
+    local -a args=(run -d --name "$TARGET" --restart unless-stopped
+        --memory "$MEM_LIMIT" --cpus "$CPUS"
+        --log-opt max-size=10m --log-opt max-file=5
+        --label "algo3.app=$APP" --label "algo3.env=$ENV_NAME"
+        --label "algo3.release=$sha" --label "algo3.digest=$digest"
+        --label "autoheal=true"
+        --network "$NET")
+    [[ -f "$ENV_FILE" ]] && args+=(--env-file "$ENV_FILE")
+    [[ "$READ_ONLY" == true ]] && args+=(--read-only)
+    if [[ -n "$TMPFS" ]]; then
+        IFS=',' read -r -a tmpfs_paths <<<"$TMPFS"
+        for path in "${tmpfs_paths[@]}"; do args+=(--tmpfs "$path"); done
+    fi
+    args+=("$IMAGE@$digest")
+    TARGET_WAS_NEW=true
+    log "Starting $TARGET"
+    docker "${args[@]}" >/dev/null || die "Could not start $TARGET"
+    if [[ "$NETWORKS" == *,* ]]; then
+        IFS=',' read -r -a extra_networks <<<"${NETWORKS#*,}"
+        for net in "${extra_networks[@]}"; do
+            docker network connect "$net" "$TARGET" || die "Could not connect $TARGET to $net"
+        done
+    fi
 }
 
 # ── Commands ─────────────────────────────────────────────────────────────────
@@ -387,11 +479,12 @@ cmd_deploy() {
             die "Release $sha ($digest) was never verified live on $PROMOTE_FROM; refusing to promote"
     fi
 
-    PREVIOUS="$(current_upstream)"
+    PREVIOUS="$(live_container)"
     TARGET="$BASE-${sha:0:12}"
 
     if [[ "$PREVIOUS" == "$TARGET" && "$(c_status "$TARGET")" == "running" ]]; then
-        public_serves "$sha" || die "$TARGET is the current route but the public check fails"
+        ensure_site
+        public_serves "$sha" || die "$TARGET is live but the public check fails"
         DONE=true
         log "Release $sha is already live on $APP/$ENV_NAME"
         record deploy noop "$sha" "$digest" already-live
@@ -417,36 +510,15 @@ cmd_deploy() {
         fi
         log "Reusing retained container $TARGET"
         TARGET_WAS_NEW=false
+        # A retained release keeps its alias; drop it before starting, so it
+        # takes no traffic until it has passed its checks again.
+        set_alias "$TARGET" off
         docker start "$TARGET" >/dev/null || die "Could not start $TARGET"
     else
-        local -a args=(run -d --name "$TARGET" --restart unless-stopped
-            --memory "$MEM_LIMIT" --cpus "$CPUS"
-            --log-opt max-size=10m --log-opt max-file=5
-            --label "algo3.app=$APP" --label "algo3.env=$ENV_NAME"
-            --label "algo3.release=$sha" --label "algo3.digest=$digest"
-            --label "autoheal=true"
-            --network "${NETWORKS%%,*}")
-        [[ -f "$ENV_FILE" ]] && args+=(--env-file "$ENV_FILE")
-        [[ "$READ_ONLY" == true ]] && args+=(--read-only)
-        if [[ -n "$TMPFS" ]]; then
-            local path
-            IFS=',' read -r -a tmpfs_paths <<<"$TMPFS"
-            for path in "${tmpfs_paths[@]}"; do args+=(--tmpfs "$path"); done
-        fi
-        args+=("$IMAGE@$digest")
-        TARGET_WAS_NEW=true
-        log "Starting $TARGET"
-        docker "${args[@]}" >/dev/null || die "Could not start $TARGET"
-        local net
-        IFS=',' read -r -a extra_networks <<<"${NETWORKS#*,}"
-        if [[ "$NETWORKS" == *,* ]]; then
-            for net in "${extra_networks[@]}"; do
-                docker network connect "$net" "$TARGET" || die "Could not connect $TARGET to $net"
-            done
-        fi
+        start_release "$sha" "$digest"
     fi
 
-    switch_to "$TARGET" "$sha"
+    make_live "$TARGET" "$sha"
     retire "$PREVIOUS"
     history_add "$sha" "$digest"
     DONE=true
@@ -459,7 +531,7 @@ cmd_deploy() {
 cmd_rollback() {
     local name sha
     ACTION=rollback
-    PREVIOUS="$(current_upstream)"
+    PREVIOUS="$(live_container)"
     [[ -n "$PREVIOUS" ]] || die "$APP/$ENV_NAME has no live release to roll back from"
     while IFS= read -r name; do
         [[ -n "$name" && "$name" != "$PREVIOUS" ]] && { TARGET="$name"; break; }
@@ -470,9 +542,9 @@ cmd_rollback() {
     TARGET_SHA="$sha"; TARGET_DIGEST="$(c_label "$TARGET" algo3.digest)"; TARGET_WAS_NEW=false
 
     log "Rolling $APP/$ENV_NAME back from $PREVIOUS to $TARGET"
+    set_alias "$TARGET" off
     docker start "$TARGET" >/dev/null || die "Could not start $TARGET"
-    switch_to "$TARGET" "$sha"
-    docker stop "$PREVIOUS" >/dev/null || log "WARNING: could not stop $PREVIOUS"
+    make_live "$TARGET" "$sha"
     DONE=true
     record rollback ok "$sha" "$TARGET_DIGEST" "from=$PREVIOUS"
     heartbeat ok
@@ -481,7 +553,7 @@ cmd_rollback() {
 
 cmd_status() {
     local name
-    printf 'live: %s\n' "$(current_upstream || true)"
+    printf 'live: %s\n' "$(live_container)"
     while IFS= read -r name; do
         printf '%s  %s  release=%s\n' "$name" "$(c_status "$name")" "$(c_label "$name" algo3.release)"
     done < <(app_containers)

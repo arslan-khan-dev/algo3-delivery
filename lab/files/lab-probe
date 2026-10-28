@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Requests https://nexwe.app every 0.1 s, one line per request: "<epoch> <http code>".
+# Code 000 means no answer at all (connection refused or timed out).
+echo $$ > /tmp/probe.pid
+while :; do
+    printf '%s %s\n' "$(date +%s.%N)" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 https://nexwe.app/)"
+    sleep 0.1
+done
