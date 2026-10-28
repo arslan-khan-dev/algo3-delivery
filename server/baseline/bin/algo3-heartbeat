@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# algo3-heartbeat — every 5 minutes, tell healthchecks.io the box is alive.
+#
+# The alert that matters most is the one this script CANNOT send: if the
+# server is down, frozen or unreachable, the ping simply stops arriving and
+# healthchecks.io alerts after the grace period. When the box is up but
+# something basic is wrong, it pings /fail with the reason.
+set -uo pipefail
+
+readonly CONF="${ALGO3_MONITORING_CONF:-/etc/algo3/monitoring.conf}"
+
+setting() {   # setting <KEY>: value from the conf, data only (never sourced)
+    [[ -f "$CONF" ]] || return 0
+    sed -nE "s/^$1=\"?([^\"]*)\"?$/\1/p" "$CONF" | tail -1
+}
+
+url="$(setting BOX_CHECK_URL)"
+limit="$(setting DISK_FAIL_PERCENT)"; limit="${limit:-85}"
+[[ -n "$url" ]] || { echo "BOX_CHECK_URL not set; nothing to ping"; exit 0; }
+[[ "$url" =~ ^https://[A-Za-z0-9./_-]+$ ]] || { echo "BOX_CHECK_URL is not a plain https URL" >&2; exit 1; }
+
+problems=()
+systemctl is-active --quiet docker || problems+=("docker is not active")
+used="$(df --output=pcent / | tail -1 | tr -dc '0-9')"
+[[ -n "$used" && "$used" -ge "$limit" ]] && problems+=("root disk ${used}% used (limit ${limit}%)")
+[[ -f /etc/algo3/delivery.conf ]] || problems+=("/etc/algo3/delivery.conf missing")
+
+if [[ ${#problems[@]} -gt 0 ]]; then
+    printf 'heartbeat: FAIL: %s\n' "${problems[*]}"
+    curl -fsS -m 10 --retry 3 --data-raw "${problems[*]}" "$url/fail" >/dev/null
+else
+    printf 'heartbeat: ok (disk %s%%)\n' "$used"
+    curl -fsS -m 10 --retry 3 --data-raw "ok disk=${used}%" "$url" >/dev/null
+fi

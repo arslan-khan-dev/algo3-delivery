@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# algo3-maintenance-check — daily. The server never reboots by itself; when a
+# security update needs a reboot, Ubuntu creates /var/run/reboot-required and
+# this check fails until someone reboots at a time they choose.
+set -uo pipefail
+
+readonly CONF="${ALGO3_MONITORING_CONF:-/etc/algo3/monitoring.conf}"
+readonly FLAG="${ALGO3_REBOOT_FLAG:-/var/run/reboot-required}"
+
+setting() {
+    [[ -f "$CONF" ]] || return 0
+    sed -nE "s/^$1=\"?([^\"]*)\"?$/\1/p" "$CONF" | tail -1
+}
+
+url="$(setting MAINTENANCE_CHECK_URL)"
+[[ -n "$url" ]] || { echo "MAINTENANCE_CHECK_URL not set; nothing to ping"; exit 0; }
+[[ "$url" =~ ^https://[A-Za-z0-9./_-]+$ ]] || { echo "MAINTENANCE_CHECK_URL is not a plain https URL" >&2; exit 1; }
+
+if [[ -e "$FLAG" ]]; then
+    packages="$(tr '\n' ' ' < "$FLAG.pkgs" 2>/dev/null || true)"
+    echo "maintenance: reboot required (${packages:-unknown packages})"
+    curl -fsS -m 10 --retry 3 --data-raw "Reboot required for: ${packages:-unknown packages}" "$url/fail" >/dev/null
+else
+    echo "maintenance: no reboot pending"
+    curl -fsS -m 10 --retry 3 --data-raw "no reboot pending" "$url" >/dev/null
+fi

@@ -1,0 +1,4 @@
+// algo3: security updates install automatically, but the server NEVER reboots
+// by itself. When an update needs a reboot, /var/run/reboot-required appears
+// and algo3-maintenance-check raises an alert; a person chooses the time.
+Unattended-Upgrade::Automatic-Reboot "false";

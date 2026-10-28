@@ -1,0 +1,11 @@
+# /etc/algo3/monitoring.conf — off-box alerting (healthchecks.io).
+# Created by baseline.sh; never overwritten. Empty URL = check not set up yet.
+
+# "box" check: period 5 min, grace 10 min. Pinged by algo3-heartbeat.
+BOX_CHECK_URL=
+
+# "maintenance" check: period 1 day, grace 2 h. Fails while a reboot is pending.
+MAINTENANCE_CHECK_URL=
+
+# The box heartbeat reports failure at or above this root-disk usage.
+DISK_FAIL_PERCENT=85

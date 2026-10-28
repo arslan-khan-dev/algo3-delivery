@@ -1,0 +1,8 @@
+[Unit]
+Description=algo3 weekly Docker image and build-cache prune (never containers)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/algo3-prune

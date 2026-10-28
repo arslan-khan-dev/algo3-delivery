@@ -1,0 +1,65 @@
+# algo3-ops — the server's own watchdogs. Installed to /opt/algo3/ops and run
+# as compose project "algo3-ops":
+#   sudo docker compose -p algo3-ops -f /opt/algo3/ops/compose.yml up -d
+#
+# Both images are pinned by digest: autoheal has published no version tag
+# since 2021, so its digest is the only immutable reference.
+name: algo3-ops
+
+services:
+  # Docker restarts a container that EXITS, but not one that is running and
+  # broken. autoheal restarts any container labelled autoheal=true whose
+  # healthcheck reports unhealthy. algo3-deploy puts that label on every
+  # release it starts.
+  autoheal:
+    image: willfarrell/autoheal@sha256:a4645c87683564c02154fbfb056eba3431cdb32b48c923359c3d55c4ec56ce89
+    container_name: autoheal
+    restart: unless-stopped
+    network_mode: none
+    mem_limit: 32m
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: '10'
+      AUTOHEAL_START_PERIOD: '60'
+      AUTOHEAL_DEFAULT_STOP_TIMEOUT: '30'
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # Metrics and alerts for the host and every container: disk, RAM, OOM kills,
+  # unhealthy or restart-looping containers, TLS certificate expiry. Alerts go
+  # to Telegram. Local only: no Netdata Cloud, dashboard on 127.0.0.1:19999,
+  # reached through an SSH tunnel.
+  netdata:
+    image: netdata/netdata:v2.12.2@sha256:3d00de3756e1e9150c6121080934168ab5f2ceffce6d494573316c09c18adf83
+    container_name: netdata
+    hostname: algo3-vps
+    restart: unless-stopped
+    pid: host
+    network_mode: host
+    mem_limit: 300m
+    cap_add: [SYS_PTRACE, SYS_ADMIN]
+    security_opt: [apparmor:unconfined]
+    env_file: .env
+    environment:
+      DO_NOT_TRACK: '1'
+    volumes:
+      - ./netdata/netdata.conf:/etc/netdata/netdata.conf:ro
+      - ./netdata/cloud.conf:/etc/netdata/cloud.d/cloud.conf:ro
+      - ./netdata/health_alarm_notify.conf:/etc/netdata/health_alarm_notify.conf:ro
+      - ./netdata/health.d/docker.conf:/etc/netdata/health.d/docker.conf:ro
+      - ./netdata/go.d/x509check.conf:/etc/netdata/go.d/x509check.conf:ro
+      - netdata-lib:/var/lib/netdata
+      - netdata-cache:/var/cache/netdata
+      - /:/host/root:ro,rslave
+      - /etc/passwd:/host/etc/passwd:ro
+      - /etc/group:/host/etc/group:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/os-release:/host/etc/os-release:ro
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /var/log:/host/var/log:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+volumes:
+  netdata-lib:
+  netdata-cache:

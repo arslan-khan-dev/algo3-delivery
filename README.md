@@ -30,6 +30,10 @@ server: ssh (key pinned to one app/env) ─► algo3-deploy-ssh ─► sudo algo
 | `server/install.sh` | Idempotent installer (`--app <name>` for a registry entry) |
 | `server/apps/<app>/` | Per-app registry: `<env>.conf` and `<env>.caddy.tmpl` |
 | `server/test/run.sh` | The test suite. It fakes docker and curl and covers every failure path |
+| `server/baseline/baseline.sh` | Server baseline, one component at a time: `sysctl`, `apt`, `docker`, `timers`, `ops`, `ssh` |
+| `server/baseline/ops/` | autoheal (restarts unhealthy containers) + Netdata (alerts to Telegram), pinned by digest |
+| `server/baseline/bin/` | Heartbeat to healthchecks.io (every 5 min), pending-reboot alert (daily), image prune (weekly; never containers) |
+| `server/baseline/test/baseline-test.sh` | Validates every config with the real tool that reads it, and tests the alert scripts |
 
 ## Everyday operations (on the server, as `algo3`)
 
