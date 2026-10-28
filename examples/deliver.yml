@@ -1,0 +1,32 @@
+# Copy to <product repo>/.github/workflows/deliver.yml and adjust the inputs.
+# This is the whole CI/CD for the product: everything else lives in
+# arslan-khan-dev/algo3-delivery.
+#
+#   push / merge to staging → tests, image, deploy to staging
+#   push / merge to main    → deploy the SAME image to production, only if
+#                             that exact code already passed staging
+name: Deliver
+
+on:
+  push:
+    branches: [staging, main]
+
+concurrency:
+  group: deliver-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deliver:
+    # Pin to a release tag (or a commit SHA) of algo3-delivery, not to main.
+    uses: arslan-khan-dev/algo3-delivery/.github/workflows/deploy-app.yml@v1
+    permissions:
+      contents: read
+      packages: write
+      deployments: read
+    secrets: inherit
+    with:
+      app: nexwe-website
+      staging-url: https://staging.nexwe.app
+      production-url: https://nexwe.app
+      # node-version: "22"
+      # validate-command: npm ci && npm test

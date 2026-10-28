@@ -1,0 +1,4 @@
+# The CI deploy account may run exactly one program as root, with no
+# arguments. Everything it is allowed to ask for arrives on stdin and is
+# validated by the wrapper.
+algo3-deploy ALL=(root) NOPASSWD: /usr/local/sbin/algo3-deploy-wrapper ""

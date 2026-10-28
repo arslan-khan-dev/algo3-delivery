@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Fake journalctl: nothing to follow in tests.
+exec sleep 30

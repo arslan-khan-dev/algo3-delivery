@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# algo3-deploy-ssh — forced command for CI deploy keys.
+#
+# Each key in ~algo3-deploy/.ssh/authorized_keys is pinned to ONE app and env:
+#   restrict,command="/usr/local/sbin/algo3-deploy-ssh nexwe-website staging" ssh-ed25519 AAAA… ci-nexwe-website-staging
+#
+# Whatever command the client asks for (SSH_ORIGINAL_COMMAND) is ignored. The
+# only input taken from the client is stdin: the SHA and the image digest. A
+# leaked staging key therefore cannot deploy production, or another app, or
+# run a shell.
+set -Eeuo pipefail
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+[[ $# -eq 2 ]] || die "Misconfigured forced command: expected <app> <env>"
+app="$1"
+env="$2"
+
+IFS= read -r -t 10 sha || die "Missing commit SHA"
+digest=""
+IFS= read -r -t 10 digest || true
+if IFS= read -r -t 2 _; then die "Unexpected additional input"; fi
+
+[[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "Expected a full lowercase 40-character commit SHA"
+[[ -z "$digest" || "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "Invalid image digest"
+
+printf '%s\n%s\n%s\n%s\n' "$app" "$env" "$sha" "$digest" |
+    exec sudo -n /usr/local/sbin/algo3-deploy-wrapper

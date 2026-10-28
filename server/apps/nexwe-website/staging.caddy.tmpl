@@ -1,0 +1,5 @@
+staging.nexwe.app {
+	encode zstd gzip
+	header X-Robots-Tag "noindex, nofollow, noarchive"
+	reverse_proxy {{UPSTREAM}}
+}

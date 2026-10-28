@@ -1,0 +1,8 @@
+/var/log/algo3/*.log {
+    monthly
+    rotate 24
+    compress
+    missingok
+    notifempty
+    create 0640 root adm
+}

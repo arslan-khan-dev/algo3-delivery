@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# algo3-deploy-wrapper — the ONLY command the deploy account may run with sudo.
+#
+# stdin, one value per line, nothing else accepted:
+#   app
+#   env
+#   full 40-character commit sha
+#   sha256:<digest>          (optional; required where the env has PROMOTE_FROM)
+#
+# The deploy runs as a transient systemd unit rather than as a child of this
+# process. If the SSH session that started it drops, the unit keeps going and
+# either finishes or recovers; only the log stream to the caller is lost.
+# Afterwards: `journalctl -u 'algo3-deploy-<app>-<env>-*'` and
+# /var/log/algo3/deploys.log show what happened.
+set -Eeuo pipefail
+
+readonly DEPLOY=/usr/local/libexec/algo3-deploy
+readonly APPS=/etc/algo3/apps
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+[[ $# -eq 0 ]] || die "This wrapper accepts no command-line arguments"
+[[ $EUID -eq 0 ]] || die "Must be run through sudo"
+
+IFS= read -r -t 10 app || die "Missing app"
+IFS= read -r -t 10 env || die "Missing environment"
+IFS= read -r -t 10 sha || die "Missing commit SHA"
+digest=""
+IFS= read -r -t 10 digest || true
+if IFS= read -r -t 2 _; then die "Unexpected additional input"; fi
+
+[[ "$app" =~ ^[a-z][a-z0-9-]{1,40}$ ]] || die "Invalid app name"
+[[ "$env" =~ ^[a-z][a-z0-9-]{0,20}$ ]] || die "Invalid environment name"
+[[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "Expected a full lowercase 40-character commit SHA"
+[[ -z "$digest" || "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "Invalid image digest"
+[[ -f "$APPS/$app/$env.conf" ]] || die "$app/$env is not registered on this server"
+[[ -x "$DEPLOY" ]] || die "Deployer not installed"
+
+unit="algo3-deploy-$app-$env-$(date +%s)"
+printf 'Deploy unit: %s\n' "$unit"
+
+journalctl --follow --lines=0 --output=cat --unit "$unit" &
+follower=$!
+
+rc=0
+systemd-run --unit "$unit" --wait --collect --quiet \
+    --property=RuntimeMaxSec=1200 \
+    "$DEPLOY" deploy "$app" "$env" "$sha" ${digest:+"$digest"} || rc=$?
+
+sleep 1
+kill "$follower" 2>/dev/null || true
+wait "$follower" 2>/dev/null || true
+exit "$rc"

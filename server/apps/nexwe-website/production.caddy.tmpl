@@ -1,0 +1,8 @@
+nexwe.app {
+	encode zstd gzip
+	reverse_proxy {{UPSTREAM}}
+}
+
+www.nexwe.app {
+	redir https://nexwe.app{uri} permanent
+}

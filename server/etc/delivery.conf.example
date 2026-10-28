@@ -1,0 +1,21 @@
+# /etc/algo3/delivery.conf — settings shared by every app's deploy.
+# Installed once by install.sh; never overwritten afterwards.
+
+# The edge: studio-platform's Caddy container, on the `studio` network.
+EDGE_CONTAINER=studio-caddy
+# Its main Caddyfile, as a path INSIDE the container. It must contain exactly
+# one line: import /etc/algo3/caddy/sites/*.caddy
+EDGE_MAIN_CONFIG=/etc/caddy/Caddyfile
+
+# Mounted read-only into the edge at the SAME path, so a file written here by
+# the deployer is the file Caddy reads.
+SITES_DIR=/etc/algo3/caddy/sites
+CHECK_DIR=/etc/algo3/caddy/check
+
+# Public checks go to the edge on this machine (with the real hostname and TLS),
+# not out to the internet and back.
+PUBLIC_CHECK_IP=127.0.0.1
+
+# healthchecks.io check for deploys: pinged on success, /fail on failure.
+# Leave empty until the check exists.
+HEARTBEAT_URL=

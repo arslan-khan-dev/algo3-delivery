@@ -1,0 +1,320 @@
+# Reusable delivery workflow for every algo3 product.
+#
+# A product repo calls this on push to `staging` and `main` (see
+# examples/deliver.yml). What happens:
+#
+#   push staging ─► validate ─► build (image :<sha>, by digest) ─► deploy staging
+#   push main    ─► promote (find the staging deploy with the SAME git tree)
+#                ─► deploy production with staging's exact image digest
+#
+# Production never rebuilds and never deploys code that did not pass staging.
+# The server enforces the same rule independently (PROMOTE_FROM=staging), so a
+# bug or a compromise in this workflow cannot skip staging on its own.
+#
+# Per-environment settings live in GitHub Environments named
+# `<app>-staging` and `<app>-production`:
+#   secret   DEPLOY_SSH_KEY    private key pinned on the server to that app/env
+#   variable VPS_HOST          server address
+#   variable VPS_KNOWN_HOSTS   the server's host key line (host-key checking is
+#                              never disabled)
+name: algo3 deliver
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: Registered app name on the server (/etc/algo3/apps/<app>)
+        type: string
+        required: true
+      context:
+        type: string
+        default: .
+      dockerfile:
+        type: string
+        default: Dockerfile
+      node-version:
+        description: Set to run validate-command with Node (e.g. "22")
+        type: string
+        default: ""
+      validate-command:
+        description: Lint/test/typecheck command; empty skips (the image build is then the only check)
+        type: string
+        default: ""
+      container-port:
+        type: string
+        default: "80"
+      release-path:
+        type: string
+        default: /release.json
+      release-key:
+        type: string
+        default: release
+      scan-severity:
+        description: Image vulnerabilities at these severities fail the build
+        type: string
+        default: CRITICAL
+      staging-url:
+        type: string
+        default: ""
+      production-url:
+        type: string
+        default: ""
+
+permissions: {}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      image: ${{ steps.plan.outputs.image }}
+      target: ${{ steps.plan.outputs.target }}
+    steps:
+      - id: plan
+        env:
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          APP: ${{ inputs.app }}
+        run: |
+          [[ "$APP" =~ ^[a-z][a-z0-9-]{1,40}$ ]] || { echo "::error::invalid app name"; exit 1; }
+          echo "image=ghcr.io/${REPO,,}" >> "$GITHUB_OUTPUT"
+          case "$REF" in
+            refs/heads/staging) echo "target=staging" >> "$GITHUB_OUTPUT" ;;
+            refs/heads/main)    echo "target=production" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::Delivery runs only on staging and main (got $REF)"; exit 1 ;;
+          esac
+
+  validate:
+    needs: plan
+    if: needs.plan.outputs.target == 'staging' && inputs.validate-command != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: inputs.node-version != ''
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Validate
+        env:
+          VALIDATE: ${{ inputs.validate-command }}
+        run: bash -euo pipefail -c "$VALIDATE"
+
+  build:
+    needs: [plan, validate]
+    if: >-
+      always() && needs.plan.outputs.target == 'staging' &&
+      (needs.validate.result == 'success' || needs.validate.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    env:
+      IMAGE: ${{ needs.plan.outputs.image }}
+      SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # An image tag is a promise that :<sha> means one thing. Re-running the
+      # pipeline for a commit must reuse it, never rebuild a different digest.
+      - name: Reuse an existing image for this commit
+        id: existing
+        run: |
+          if digest="$(docker buildx imagetools inspect "$IMAGE:$SHA" --format '{{json .Manifest}}' 2>/dev/null | jq -r .digest)" && [[ "$digest" == sha256:* ]]; then
+            echo "digest=$digest" >> "$GITHUB_OUTPUT"
+            echo "Reusing $IMAGE:$SHA ($digest)"
+          fi
+
+      - name: Build and push
+        id: build
+        if: steps.existing.outputs.digest == ''
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.context }}/${{ inputs.dockerfile }}
+          push: true
+          provenance: false
+          tags: ${{ needs.plan.outputs.image }}:${{ github.sha }}
+          build-args: |
+            RELEASE_SHA=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Record digest
+        id: digest
+        env:
+          EXISTING: ${{ steps.existing.outputs.digest }}
+          BUILT: ${{ steps.build.outputs.digest }}
+        run: |
+          digest="${EXISTING:-$BUILT}"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image digest"; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test the image (release marker)
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          PORT: ${{ inputs.container-port }}
+          RELEASE_PATH: ${{ inputs.release-path }}
+          RELEASE_KEY: ${{ inputs.release-key }}
+        run: |
+          docker run -d --name smoke -p "127.0.0.1:18080:$PORT" "$IMAGE@$DIGEST" >/dev/null
+          body='{}'
+          for _ in $(seq 1 30); do
+            if body="$(curl -fsS "http://127.0.0.1:18080$RELEASE_PATH")"; then break; fi
+            sleep 2
+          done
+          got="$(jq -r --arg k "$RELEASE_KEY" '.[$k] // empty' <<<"$body")"
+          docker rm -f smoke >/dev/null
+          [[ "$got" == "$SHA" ]] || { echo "::error::image reports release '$got', expected $SHA"; exit 1; }
+          echo "Image serves release $SHA"
+
+      - name: Scan the image
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          SEVERITY: ${{ inputs.scan-severity }}
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.76.1 \
+            image --quiet --ignore-unfixed --exit-code 1 --severity "$SEVERITY" "$IMAGE@$DIGEST"
+
+  deploy-staging:
+    needs: [plan, build]
+    if: needs.plan.outputs.target == 'staging'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions: {}
+    concurrency:
+      group: algo3-${{ inputs.app }}-staging
+      cancel-in-progress: false
+    environment:
+      name: ${{ inputs.app }}-staging
+      url: ${{ inputs.staging-url }}
+    steps:
+      - name: Deploy through the server's forced command
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ vars.VPS_HOST }}
+          KNOWN_HOSTS: ${{ vars.VPS_KNOWN_HOSTS }}
+          SHA: ${{ github.sha }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: &deploy |
+          [[ -n "$KEY" && -n "$HOST" && -n "$KNOWN_HOSTS" ]] || { echo "::error::DEPLOY_SSH_KEY, VPS_HOST and VPS_KNOWN_HOSTS must be set on this environment"; exit 1; }
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          printf '%s\n%s\n' "$SHA" "$DIGEST" |
+            ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes \
+                -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
+                -o ServerAliveInterval=15 -o ConnectTimeout=20 \
+                "algo3-deploy@$HOST"
+      - name: Verify from the internet
+        if: inputs.staging-url != ''
+        env:
+          URL: ${{ inputs.staging-url }}
+          RELEASE_PATH: ${{ inputs.release-path }}
+          RELEASE_KEY: ${{ inputs.release-key }}
+          SHA: ${{ github.sha }}
+        run: &verify |
+          got="$(curl -fsS --retry 5 --retry-delay 3 -H 'Cache-Control: no-cache' "$URL$RELEASE_PATH" | jq -r --arg k "$RELEASE_KEY" '.[$k] // empty')"
+          [[ "$got" == "$SHA" ]] || { echo "::error::$URL serves '$got', expected $SHA"; exit 1; }
+          {
+            echo "### Deployed"
+            echo "- URL: $URL"
+            echo "- Release: \`$SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  promote:
+    needs: plan
+    if: needs.plan.outputs.target == 'production'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      deployments: read
+      packages: read
+    outputs:
+      sha: ${{ steps.find.outputs.sha }}
+      digest: ${{ steps.find.outputs.digest }}
+    steps:
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Compare git TREES, not commit SHAs: a merge commit or a fast-forward of
+      # staging into main both qualify, as long as the code is identical.
+      - name: Find the staging deploy of this exact code
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          ENVIRONMENT: ${{ inputs.app }}-staging
+          IMAGE: ${{ needs.plan.outputs.image }}
+        run: |
+          tree="$(gh api "repos/$REPO/git/commits/$SHA" --jq .tree.sha)"
+          echo "main $SHA has tree $tree"
+          found=""
+          while IFS= read -r line; do
+            id="${line%% *}"; candidate="${line##* }"
+            state="$(gh api "repos/$REPO/deployments/$id/statuses?per_page=1" --jq '.[0].state // ""')"
+            [[ "$state" == success ]] || continue
+            [[ "$(gh api "repos/$REPO/git/commits/$candidate" --jq .tree.sha)" == "$tree" ]] || continue
+            found="$candidate"; break
+          done < <(gh api "repos/$REPO/deployments?environment=$ENVIRONMENT&per_page=30" --jq '.[] | "\(.id) \(.sha)"')
+          if [[ -z "$found" ]]; then
+            echo "::error::This code was never deployed successfully to staging. Merge it to staging first; production only promotes tested releases."
+            exit 1
+          fi
+          digest="$(docker buildx imagetools inspect "$IMAGE:$found" --format '{{json .Manifest}}' | jq -r .digest)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image for $found"; exit 1; }
+          echo "Promoting staging release $found ($digest)"
+          echo "sha=$found" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  deploy-production:
+    needs: [plan, promote]
+    if: needs.plan.outputs.target == 'production'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions: {}
+    concurrency:
+      group: algo3-${{ inputs.app }}-production
+      cancel-in-progress: false
+    environment:
+      name: ${{ inputs.app }}-production
+      url: ${{ inputs.production-url }}
+    steps:
+      - name: Deploy through the server's forced command
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ vars.VPS_HOST }}
+          KNOWN_HOSTS: ${{ vars.VPS_KNOWN_HOSTS }}
+          SHA: ${{ needs.promote.outputs.sha }}
+          DIGEST: ${{ needs.promote.outputs.digest }}
+        run: *deploy
+      - name: Verify from the internet
+        if: inputs.production-url != ''
+        env:
+          URL: ${{ inputs.production-url }}
+          RELEASE_PATH: ${{ inputs.release-path }}
+          RELEASE_KEY: ${{ inputs.release-key }}
+          SHA: ${{ needs.promote.outputs.sha }}
+        run: *verify

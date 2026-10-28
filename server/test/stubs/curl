@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""Fake `curl`. With --resolve it plays the public edge: it serves whatever the
+LAST SUCCESSFUL `caddy reload` routed the hostname to. Without --resolve it is
+a heartbeat ping, recorded in $STUB_DIR/heartbeats."""
+import json, os, sys
+
+STATE = os.path.join(os.environ["STUB_DIR"], "state.json")
+args = sys.argv[1:]
+url = args[-1]
+
+if "--resolve" not in args:
+    with open(os.path.join(os.environ["STUB_DIR"], "heartbeats"), "a") as f:
+        f.write(url + "\n")
+    sys.exit(0)
+
+with open(STATE) as f:
+    s = json.load(f)
+host, _, path = url[len("https://"):].partition("/")
+upstream = s.get("routes", {}).get(host)
+c = s["containers"].get(upstream or "")
+if os.environ.get("STUB_PUBLIC_FAIL") or not c or c["status"] != "running":
+    sys.exit(22)
+rel = c["labels"].get("algo3.release", "")
+if rel and rel == os.environ.get("STUB_NEVER_READY", ""):
+    sys.exit(22)
+if path.endswith("release.json"):
+    if os.environ.get("STUB_PUBLIC_WRONG"):
+        rel = "f" * 40
+    print(json.dumps({"release": rel}))
+else:
+    print("<html>ok</html>")

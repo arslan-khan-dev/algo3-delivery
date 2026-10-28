@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Fake sudo for the SSH-shim tests: drop -n and run the wrapper directly.
+[[ "$1" == -n ]] && shift
+exec "$STUB_WRAPPER"

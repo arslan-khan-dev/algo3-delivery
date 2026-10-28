@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Fake systemd-run: skip the unit options and run the command in the foreground.
+while [[ $# -gt 0 && "$1" == -* || "$1" == --* ]]; do
+    case "$1" in --unit|--property) shift 2 ;; *) shift ;; esac
+done
+exec "$@"
