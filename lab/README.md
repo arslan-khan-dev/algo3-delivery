@@ -1,5 +1,7 @@
 # The lab: rehearse every server step on your PC first
 
+> New here? **`GUIDE.md`** walks through the whole process step by step: the tests, building the lab, every phase, doing it by hand, and moving to the server.
+
 `algo3-lab` is a disposable container that stands in for the algo3-vps. It has
 real systemd, sshd, Docker and a host Caddy, and it is seeded to **the
 server's state as inventoried on 2026-10-28**:

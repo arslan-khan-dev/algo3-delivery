@@ -39,7 +39,7 @@ server: ssh (key pinned to one app/env) ─► algo3-deploy-ssh ─► sudo algo
 | `server/test/run.sh` | The test suite. It fakes docker and curl and covers every failure path |
 | `edge/` | `algo3-edge`, the single Caddy container on 80/443, its installer, and `CUTOVER.md` |
 | `docs/rollout-nexwe-website.md` | Phase 4: GitHub settings, deploy keys, the first automatic deploys |
-| `lab/` | A local stand-in for the VPS. Every server step is rehearsed there first (see `lab/README.md`) |
+| `lab/` | A local stand-in for the VPS. Every server step is rehearsed there first. **Start with `lab/GUIDE.md`**: the step-by-step guide, from the first test to the server |
 | `server/baseline/baseline.sh` | Server baseline, one component at a time: `sysctl`, `apt`, `docker`, `timers`, `ops`, `ssh` |
 | `server/baseline/ops/` | autoheal (restarts unhealthy containers) + Netdata (alerts to Telegram), pinned by digest |
 | `server/baseline/bin/` | Heartbeat to healthchecks.io (every 5 min), pending-reboot alert (daily), image prune (weekly; never containers) |
