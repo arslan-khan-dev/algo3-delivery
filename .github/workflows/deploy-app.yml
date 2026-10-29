@@ -26,14 +26,35 @@ on:
         description: Registered app name on the server (/etc/algo3/apps/<app>)
         type: string
         required: true
+      image:
+        description: >-
+          Image name without tag. Default ghcr.io/<owner>/<repo>. Set one per
+          service when a repo ships several (e.g. ghcr.io/acme/atlas-api).
+        type: string
+        default: ""
       context:
         type: string
         default: .
       dockerfile:
         type: string
         default: Dockerfile
+      target:
+        description: Dockerfile stage to build (multi-stage repos with several services)
+        type: string
+        default: ""
+      build-args:
+        description: Extra build args, one KEY=value per line (RELEASE_SHA is always passed)
+        type: string
+        default: ""
+      validate-image:
+        description: >-
+          Run validate-command inside this image, for any language:
+          node:22, python:3.12, golang:1.24, eclipse-temurin:21… The repo is
+          mounted at /src.
+        type: string
+        default: ""
       node-version:
-        description: Set to run validate-command with Node (e.g. "22")
+        description: Alternative to validate-image for Node projects (e.g. "22")
         type: string
         default: ""
       validate-command:
@@ -43,7 +64,15 @@ on:
       container-port:
         type: string
         default: "80"
+      smoke:
+        description: >-
+          Image smoke test before anything deploys: auto (release marker if
+          release-path is set, else "running"), http, running (container stays
+          up 10 s: workers), none
+        type: string
+        default: auto
       release-path:
+        description: Release marker URL path; empty for apps without one
         type: string
         default: /release.json
       release-key:
@@ -75,9 +104,12 @@ jobs:
           REPO: ${{ github.repository }}
           REF: ${{ github.ref }}
           APP: ${{ inputs.app }}
+          IMAGE: ${{ inputs.image }}
         run: |
           [[ "$APP" =~ ^[a-z][a-z0-9-]{1,40}$ ]] || { echo "::error::invalid app name"; exit 1; }
-          echo "image=ghcr.io/${REPO,,}" >> "$GITHUB_OUTPUT"
+          image="${IMAGE:-ghcr.io/${REPO,,}}"
+          [[ "$image" =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]+)?(/[a-z0-9._-]+)+$ ]] || { echo "::error::invalid image name: $image"; exit 1; }
+          echo "image=$image" >> "$GITHUB_OUTPUT"
           case "$REF" in
             refs/heads/staging) echo "target=staging" >> "$GITHUB_OUTPUT" ;;
             refs/heads/main)    echo "target=production" >> "$GITHUB_OUTPUT" ;;
@@ -95,14 +127,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - if: inputs.node-version != ''
+      - if: inputs.node-version != '' && inputs.validate-image == ''
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ inputs.node-version }}
       - name: Validate
         env:
           VALIDATE: ${{ inputs.validate-command }}
-        run: bash -euo pipefail -c "$VALIDATE"
+          VALIDATE_IMAGE: ${{ inputs.validate-image }}
+        run: |
+          if [[ -n "$VALIDATE_IMAGE" ]]; then
+            # Any language: the project's own toolchain image, repo at /src.
+            docker run --rm -v "$PWD:/src" -w /src -e CI=true "$VALIDATE_IMAGE" sh -c "$VALIDATE"
+          else
+            bash -euo pipefail -c "$VALIDATE"
+          fi
 
   build:
     needs: [plan, validate]
@@ -150,8 +189,10 @@ jobs:
           push: true
           provenance: false
           tags: ${{ needs.plan.outputs.image }}:${{ github.sha }}
+          target: ${{ inputs.target }}
           build-args: |
             RELEASE_SHA=${{ github.sha }}
+            ${{ inputs.build-args }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -168,23 +209,43 @@ jobs:
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image digest"; exit 1; }
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
-      - name: Smoke test the image (release marker)
+      - name: Smoke test the image
+        if: inputs.smoke != 'none'
         env:
           DIGEST: ${{ steps.digest.outputs.digest }}
           PORT: ${{ inputs.container-port }}
           RELEASE_PATH: ${{ inputs.release-path }}
           RELEASE_KEY: ${{ inputs.release-key }}
+          SMOKE: ${{ inputs.smoke }}
         run: |
-          docker run -d --name smoke -p "127.0.0.1:18080:$PORT" "$IMAGE@$DIGEST" >/dev/null
-          body='{}'
-          for _ in $(seq 1 30); do
-            if body="$(curl -fsS "http://127.0.0.1:18080$RELEASE_PATH")"; then break; fi
-            sleep 2
-          done
-          got="$(jq -r --arg k "$RELEASE_KEY" '.[$k] // empty' <<<"$body")"
-          docker rm -f smoke >/dev/null
-          [[ "$got" == "$SHA" ]] || { echo "::error::image reports release '$got', expected $SHA"; exit 1; }
-          echo "Image serves release $SHA"
+          mode="$SMOKE"
+          [[ "$mode" == auto ]] && { [[ -n "$RELEASE_PATH" ]] && mode=http || mode=running; }
+          case "$mode" in
+            http)
+              # The image serves its own commit at the release marker.
+              docker run -d --name smoke -p "127.0.0.1:18080:$PORT" "$IMAGE@$DIGEST" >/dev/null
+              body='{}'
+              for _ in $(seq 1 30); do
+                if body="$(curl -fsS "http://127.0.0.1:18080$RELEASE_PATH")"; then break; fi
+                sleep 2
+              done
+              got="$(jq -r --arg k "$RELEASE_KEY" '.[$k] // empty' <<<"$body")"
+              docker rm -f smoke >/dev/null
+              [[ "$got" == "$SHA" ]] || { echo "::error::image reports release '$got', expected $SHA"; exit 1; }
+              echo "Image serves release $SHA" ;;
+            running)
+              # No HTTP (workers) or no marker: the image starts and stays up.
+              # Runtime secrets are not available here; an app that exits
+              # without them should use smoke: none and rely on the deploy checks.
+              docker run -d --name smoke "$IMAGE@$DIGEST" >/dev/null
+              sleep 10
+              state="$(docker inspect -f '{{.State.Status}} {{.RestartCount}}' smoke)"
+              docker logs --tail 20 smoke || true
+              docker rm -f smoke >/dev/null
+              [[ "$state" == "running 0" ]] || { echo "::error::image did not stay up (state: $state)"; exit 1; }
+              echo "Image starts and stays up" ;;
+            *) echo "::error::smoke must be auto, http, running or none (got $SMOKE)"; exit 1 ;;
+          esac
 
       - name: Scan the image
         env:
@@ -232,8 +293,13 @@ jobs:
           RELEASE_KEY: ${{ inputs.release-key }}
           SHA: ${{ github.sha }}
         run: &verify |
-          got="$(curl -fsS --retry 5 --retry-delay 3 -H 'Cache-Control: no-cache' "$URL$RELEASE_PATH" | jq -r --arg k "$RELEASE_KEY" '.[$k] // empty')"
-          [[ "$got" == "$SHA" ]] || { echo "::error::$URL serves '$got', expected $SHA"; exit 1; }
+          if [[ -n "$RELEASE_PATH" ]]; then
+            got="$(curl -fsS --retry 5 --retry-delay 3 -H 'Cache-Control: no-cache' "$URL$RELEASE_PATH" | jq -r --arg k "$RELEASE_KEY" '.[$k] // empty')"
+            [[ "$got" == "$SHA" ]] || { echo "::error::$URL serves '$got', expected $SHA"; exit 1; }
+          else
+            # No release marker: the server already verified the image digest.
+            curl -fsS --retry 5 --retry-delay 3 -o /dev/null "$URL" || { echo "::error::$URL does not answer"; exit 1; }
+          fi
           {
             echo "### Deployed"
             echo "- URL: $URL"

@@ -15,6 +15,8 @@ server: ssh (key pinned to one app/env) ─► algo3-deploy-ssh ─► sudo algo
            → public check → keep one rollback   (Caddy is NOT reloaded on a deploy)
 ```
 
+- **Any app, any language.** Ship a Docker image and pick a kind: `web` (public), `internal` (HTTP for other containers), or `worker` (no HTTP). Migrations run automatically from the new image before it takes traffic (`RELEASE_COMMAND`). See `docs/app-contract.md`.
+- **Any number of products and domains.** Each app declares its domains (primary, aliases, `www` redirects); one domain has exactly one owner, and every domain is checked and certificate-monitored.
 - **Deploys are automatic.** Pushing or merging to `staging` deploys staging. Merging to `main` deploys production.
 - **Production only ever runs what staging ran.** This is checked in CI (git tree), and again on the server (`PROMOTE_FROM=staging`, by sha and digest).
 - **Anything that fails before the switch leaves the live release untouched.**
@@ -24,12 +26,16 @@ server: ssh (key pinned to one app/env) ─► algo3-deploy-ssh ─► sudo algo
 | --- | --- |
 | `.github/workflows/deploy-app.yml` | The reusable workflow |
 | `examples/deliver.yml` | What a product repo adds (about 15 lines) |
+| `examples/deliver-multi-service.yml` | A repo with several services (API + web + worker), ordered |
+| `templates/dockerfiles/` | Starter Dockerfiles: static, Node API, Next.js, Python, Go, worker. Each is tested by `templates/test-templates.sh` |
+| `examples/apps/` | Tiny sample apps the template test builds |
 | `docs/app-contract.md` | Rules a product meets before onboarding, plus the checklist |
 | `server/bin/algo3-deploy` | The deployer (`deploy` / `rollback` / `status`) |
 | `server/bin/algo3-deploy-wrapper` | The only command the deploy account may `sudo` |
 | `server/bin/algo3-deploy-ssh` | Forced command on each CI key |
 | `server/install.sh` | Idempotent installer (`--app <name>` for a registry entry) |
-| `server/apps/<app>/` | Per-app registry: `<env>.conf` and `<env>.caddy.tmpl` |
+| `server/apps/<app>/` | Per-app registry: `<env>.conf` declares the image, kind and domains; the edge site is generated (an optional `<env>.caddy.tmpl` covers custom routing) |
+| `server/bin/algo3-cert-watch` | Keeps Netdata's certificate checks equal to every registered domain |
 | `server/test/run.sh` | The test suite. It fakes docker and curl and covers every failure path |
 | `edge/` | `algo3-edge`, the single Caddy container on 80/443, its installer, and `CUTOVER.md` |
 | `docs/rollout-nexwe-website.md` | Phase 4: GitHub settings, deploy keys, the first automatic deploys |

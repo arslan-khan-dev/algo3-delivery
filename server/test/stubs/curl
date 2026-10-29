@@ -21,7 +21,15 @@ with open(os.path.join(os.environ["STUB_DIR"], "public-urls"), "a") as f:
     f.write(url + "\n")
 # The edge routes a host to an alias (from the last successful reload); Docker
 # DNS answers that alias with whichever RUNNING containers hold it.
-alias = s.get("routes", {}).get(host)
+route = s.get("routes", {}).get(host)
+# STUB_DOMAIN_FAIL="a.example b.example": those names fail TLS (no certificate yet).
+if host in os.environ.get("STUB_DOMAIN_FAIL", "").split():
+    sys.exit(60)
+if route and route.startswith("redirect:"):
+    if "--write-out" in args:
+        print("301 " + route[len("redirect:"):] + "/", end="")
+    sys.exit(0)
+alias = route
 serving = [c for c in s["containers"].values() if c["status"] == "running" and alias and alias in c.get("aliases", [])]
 c = max(serving, key=lambda x: x["created"]) if serving else None
 if os.environ.get("STUB_PUBLIC_FAIL") or not c:

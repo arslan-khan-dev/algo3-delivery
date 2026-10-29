@@ -58,6 +58,38 @@ def ready(s, name):
     return True
 
 
+def edge_wget(s, url):
+    """`wget http://<container>:<port>/<path>` from the edge or a checker."""
+    host, path = url[len("http://"):].split("/", 1)
+    name = host.split(":")[0]
+    if not ready(s, name):
+        fail("wget: can't connect to remote host")
+    if path.endswith("release.json"):
+        rel = release_of(s["containers"][name])
+        if rel == flag("WRONG_MARKER"):
+            rel = "0" * 40
+        print(json.dumps({"release": rel}))
+    else:
+        print("<html>ok</html>")
+
+
+def image_id(ref):
+    return "sha256:" + hashlib.sha256(ref.encode()).hexdigest()
+
+
+def record_overlap(s, name):
+    """Note when a release starts while another release of the same app/env runs."""
+    c = s["containers"][name]
+    app, env = c["labels"].get("algo3.app"), c["labels"].get("algo3.env")
+    if not app:
+        return
+    for other, o in s["containers"].items():
+        if other != name and o["status"] == "running" and o["labels"].get("algo3.app") == app \
+                and o["labels"].get("algo3.env") == env:
+            with open(os.path.join(os.environ["STUB_DIR"], "overlaps"), "a") as f:
+                f.write(f"{name} started while {other} ran\n")
+
+
 def main(argv):
     s = load()
     cmd = argv[0]
@@ -71,9 +103,24 @@ def main(argv):
             print(c["id"])
         elif fmt == "{{.State.Status}}":
             print(c["status"])
+        elif fmt == "{{.Image}}":
+            print("sha256:swapped" if release_of(c) and release_of(c) == flag("IMAGE_SWAP") else image_id(c.get("image", "")))
+        elif fmt == "{{.RestartCount}}":
+            # A crash-looping release restarts between every two looks.
+            if release_of(c) and release_of(c) == flag("CRASHLOOP"):
+                c["restart_count"] = c.get("restart_count", 0) + 1
+                save(s)
+            print(c.get("restart_count", 0))
+        elif fmt == "{{.Config.Image}}":
+            print("caddy:lab")
+        elif fmt == "{{.State.ExitCode}}":
+            print(c.get("exit_code", 0))
         elif fmt.startswith("{{if .State.Health}}"):
             rel = release_of(c)
-            print("unhealthy" if rel and rel == flag("UNHEALTHY") else "none")
+            if rel and rel == flag("UNHEALTHY"):
+                print("unhealthy")
+            else:
+                print("healthy" if flag("HAS_HEALTHCHECK") else "none")
         elif fmt.startswith("{{index .Config.Labels"):
             key = fmt.split('"')[1]
             print(c["labels"].get(key, ""))
@@ -106,6 +153,9 @@ def main(argv):
 
     if cmd == "image":
         image = argv[-1]
+        if "{{.Id}}" in argv:
+            print(image_id(image))
+            return
         d = s.get("images", {}).get(image)
         if not d:
             fail("Error: No such image")
@@ -113,17 +163,51 @@ def main(argv):
         return
 
     if cmd == "run":
-        name, labels, i = None, {}, 1
+        name, labels, volumes, network, entrypoint, i = None, {}, [], None, None, 1
+        detached = remove = False
         while i < len(argv):
             a = argv[i]
             if a == "--name":
                 name = argv[i + 1]; i += 2
             elif a == "--label":
                 k, v = argv[i + 1].split("=", 1); labels[k] = v; i += 2
-            elif a in ("--restart", "--memory", "--cpus", "--log-opt", "--network", "--env-file", "--tmpfs"):
+            elif a == "--volume":
+                volumes.append(argv[i + 1]); i += 2
+            elif a == "--network":
+                network = argv[i + 1]; i += 2
+            elif a == "--entrypoint":
+                entrypoint = argv[i + 1]; i += 2
+            elif a in ("--restart", "--memory", "--cpus", "--log-opt", "--env-file", "--tmpfs"):
                 i += 2
-            else:
+            elif a == "-d":
+                detached = True; i += 1
+            elif a == "--rm":
+                remove = True; i += 1
+            elif a.startswith("-"):
                 i += 1
+            else:
+                break   # the image; everything after it is the command
+        image, command = argv[i], argv[i + 1:]
+
+        if remove and entrypoint == "wget":
+            # The throwaway network checker: behaves like wget from the edge.
+            with open(os.path.join(os.environ["STUB_DIR"], "checker-calls"), "a") as f:
+                f.write(f"{network} {command[-1]}\n")
+            return edge_wget(s, command[-1])
+
+        if "algo3.release-command" in labels:
+            # The release command: runs to completion; its exit code is the result.
+            with open(os.path.join(os.environ["STUB_DIR"], "release-commands"), "a") as f:
+                f.write(json.dumps({"image": image, "argv": [entrypoint] + command,
+                                    "volumes": volumes, "network": network}) + "\n")
+            code = int(flag("RELEASE_EXIT") or 0)
+            s["containers"][name] = {"id": name, "status": "exited", "labels": labels, "created": "0",
+                                     "restarts": 0, "image": image, "aliases": [], "exit_code": code,
+                                     "volumes": volumes}
+            save(s)
+            print("migrations applied" if code == 0 else "migration failed")
+            sys.exit(code)
+
         if name in s["containers"]:
             fail(f"Conflict. The container name {name} is already in use")
         if flag("RUN_FAIL"):
@@ -131,7 +215,8 @@ def main(argv):
         status = "exited" if labels.get("algo3.release") == flag("EXIT_ON_START") else "running"
         s["containers"][name] = {"id": hashlib.sha1(name.encode()).hexdigest(), "status": status,
                                  "labels": labels, "created": "%.6f" % time.time(), "restarts": 0,
-                                 "image": argv[-1], "aliases": []}
+                                 "image": image, "aliases": [], "volumes": volumes, "network": network}
+        record_overlap(s, name)
         save(s)
         print(s["containers"][name]["id"])
         return
@@ -142,9 +227,12 @@ def main(argv):
         if not c:
             fail(f"Error: No such container: {name}")
         if cmd == "start":
-            if c["status"] != "running":
+            was_running = c["status"] == "running"
+            if not was_running:
                 c["restarts"] = c.get("restarts", 0) + 1
             c["status"] = "running"
+            if not was_running:
+                record_overlap(s, name)
             # A container that holds a routed alias takes traffic the moment it
             # starts. If it is not ready, real users would hit it: record that.
             routed_aliases = set(s.get("routes", {}).values())
@@ -193,19 +281,7 @@ def main(argv):
             print(f"{{\n\tadmin localhost:2019\n}}\nimport {SITES}/*.caddy")
             return
         if rest[0] == "wget":
-            url = rest[-1]
-            host, path = url[len("http://"):].split("/", 1)
-            name = host.split(":")[0]
-            if not ready(s, name):
-                fail("wget: can't connect to remote host")
-            if path.endswith("release.json"):
-                rel = release_of(s["containers"][name])
-                if rel == flag("WRONG_MARKER"):
-                    rel = "0" * 40
-                print(json.dumps({"release": rel}))
-            else:
-                print("<html>ok</html>")
-            return
+            return edge_wget(s, rest[-1])
         if rest[0] == "caddy" and rest[1] == "validate":
             if flag("VALIDATE_FAIL"):
                 fail("Error: adapting config using caddyfile: invalid")
@@ -223,9 +299,24 @@ def main(argv):
                 with open(os.path.join(SITES, f)) as fh:
                     lines = fh.read().splitlines()
                 upstream = next((p.split("=", 1)[1] for p in lines[0].split() if p.startswith("upstream=")), "")
+                # Top-level blocks: "a.example, b.example {" serves each name;
+                # a block holding "redir https://x{uri}" redirects to x.
+                depth, names, body = 0, [], []
                 for line in lines:
-                    if line.rstrip().endswith("{") and not line.startswith(("\t", " ")):
-                        routes[line.split()[0]] = upstream
+                    st = line.strip()
+                    if not st or st.startswith("#"):
+                        continue
+                    if depth == 0 and st.endswith("{"):
+                        names = [a for a in st[:-1].replace(",", " ").split() if a]
+                        body = []
+                    elif depth > 0:
+                        body.append(st)
+                    depth += st.count("{") - st.count("}")
+                    if depth == 0 and names:
+                        redir = next((b.split()[1] for b in body if b.startswith("redir ")), None)
+                        for n in names:
+                            routes[n] = "redirect:" + redir.replace("{uri}", "") if redir else upstream
+                        names = []
             s["routes"] = routes
             save(s)
             return

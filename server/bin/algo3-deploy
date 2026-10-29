@@ -19,14 +19,24 @@
 #   Why: measured in the lab (2026-10-29), every Caddy reload drops roughly
 #   one new connection in three — on EVERY site, not just the one deployed.
 #   Moving the alias dropped none in 20 switches. The edge is reloaded only
-#   when an app's site template changes (or on its first deploy).
+#   when an app's domains or site template change (or on its first deploy).
 #
 # Every app/env is registered under /etc/algo3/apps/<app>/:
-#   <env>.conf          KEY=value settings (see examples/), root-owned
-#   <env>.caddy.tmpl    the site block; {{UPSTREAM}} becomes <app>-<env>:<port>;
-#                       its reverse_proxy MUST set lb_try_duration and a short
-#                       dial_timeout (see the nexwe-website templates)
+#   <env>.conf          KEY=value settings (see examples/), root-owned. A web
+#                       app declares its domains here: HOSTNAME (primary),
+#                       ALIASES (also served), REDIRECTS (sent to HOSTNAME),
+#                       NOINDEX=true (keep search engines out, e.g. staging).
+#                       The site is generated from these.
+#   <env>.caddy.tmpl    OPTIONAL, for routing the generated site cannot express
+#                       (e.g. /api to another app). {{UPSTREAM}} becomes
+#                       <app>-<env>:<port>, {{HOSTNAME}} the primary domain. It
+#                       must serve exactly the declared domains, and its
+#                       reverse_proxy MUST set lb_try_duration and a short
+#                       dial_timeout.
 #   <env>.env           optional runtime secrets, root 0600, never sent by CI
+#
+# One domain belongs to exactly one app/env: a deploy that would claim a domain
+# another registered app, or the platform, already serves is refused.
 #
 # Retention: exactly one previous release is kept, stopped, as the rollback.
 # The release before that is removed only AFTER a new release is verified live.
@@ -70,15 +80,22 @@ require_match() {
 }
 
 load_delivery_conf() {
-    read_conf "$ETC/delivery.conf" EDGE_CONTAINER EDGE_MAIN_CONFIG SITES_DIR CHECK_DIR \
-        PUBLIC_CHECK_IP PUBLIC_CHECK_PORT HEARTBEAT_URL
+    read_conf "$ETC/delivery.conf" EDGE_CONTAINER EDGE_NETWORK EDGE_MAIN_CONFIG SITES_DIR CHECK_DIR \
+        PUBLIC_CHECK_IP PUBLIC_CHECK_PORT HEARTBEAT_URL SERVER_IPS
     EDGE="$(conf EDGE_CONTAINER studio-caddy)"
+    EDGE_NET="$(conf EDGE_NETWORK studio)"
+    require_match EDGE_NETWORK "$EDGE_NET" '^[a-z0-9_-]+$'
     EDGE_MAIN="$(conf EDGE_MAIN_CONFIG /etc/caddy/Caddyfile)"
     SITES_DIR="$(conf SITES_DIR /etc/algo3/caddy/sites)"
     CHECK_DIR="$(conf CHECK_DIR /etc/algo3/caddy/check)"
     PUBLIC_IP="$(conf PUBLIC_CHECK_IP 127.0.0.1)"
     PUBLIC_PORT="$(conf PUBLIC_CHECK_PORT 443)"
     HEARTBEAT="$(conf HEARTBEAT_URL)"
+    # This server's public addresses. When set, every deploy checks that each
+    # domain's DNS points here and warns otherwise (a warning, not a refusal:
+    # behind a CDN such as Cloudflare, DNS legitimately points elsewhere).
+    SERVER_IPS="$(conf SERVER_IPS)"
+    require_match SERVER_IPS "$SERVER_IPS" '^([0-9a-fA-F.:]+(,[0-9a-fA-F.:]+)*)?$'
     require_match EDGE_CONTAINER "$EDGE" '^[a-z0-9][a-z0-9_.-]*$'
     require_match PUBLIC_CHECK_IP "$PUBLIC_IP" '^[0-9.]+$'
     require_match PUBLIC_CHECK_PORT "$PUBLIC_PORT" '^[0-9]{2,5}$'
@@ -87,14 +104,34 @@ load_delivery_conf() {
 load_app_conf() {
     local dir="$ETC/apps/$APP"
     CONF=()
-    read_conf "$dir/$ENV_NAME.conf" IMAGE CONTAINER_PORT HEALTH_PATH RELEASE_PATH RELEASE_KEY \
-        HOSTNAME PUBLIC_PATH NETWORKS MEM_LIMIT CPUS READ_ONLY TMPFS PROMOTE_FROM HEALTH_ATTEMPTS
+    read_conf "$dir/$ENV_NAME.conf" KIND IMAGE CONTAINER_PORT HEALTH_PATH RELEASE_PATH RELEASE_KEY \
+        HOSTNAME ALIASES REDIRECTS NOINDEX PUBLIC_PATH NETWORKS MEM_LIMIT CPUS READ_ONLY TMPFS \
+        PROMOTE_FROM HEALTH_ATTEMPTS RELEASE_COMMAND RELEASE_TIMEOUT VOLUMES OVERLAP STARTUP_SECONDS
+    # KIND decides how a release goes live:
+    #   web       HTTP, public hostname: stable alias + edge site + public check
+    #   internal  HTTP for other containers only: stable alias, no site
+    #   worker    no HTTP (queue consumer, scheduler): health from Docker, no alias
+    KIND="$(conf KIND web)"
+    require_match KIND "$KIND" '^(web|internal|worker)$'
     IMAGE="$(conf IMAGE)"
     PORT="$(conf CONTAINER_PORT 80)"
-    HEALTH_PATH="$(conf HEALTH_PATH /)"
-    RELEASE_PATH="$(conf RELEASE_PATH /release.json)"
+    if [[ "$KIND" == worker ]]; then
+        HEALTH_PATH=""; RELEASE_PATH=""
+    else
+        HEALTH_PATH="$(conf HEALTH_PATH /)"
+        # Optional: when empty, release identity rests on the image digest alone.
+        RELEASE_PATH="$(conf RELEASE_PATH "$( [[ "$KIND" == web ]] && echo /release.json )")"
+    fi
     RELEASE_KEY="$(conf RELEASE_KEY release)"
+    RELEASE_COMMAND="$(conf RELEASE_COMMAND)"
+    RELEASE_TIMEOUT="$(conf RELEASE_TIMEOUT 300)"
+    VOLUMES="$(conf VOLUMES)"
+    OVERLAP="$(conf OVERLAP true)"
+    STARTUP_SECONDS="$(conf STARTUP_SECONDS 10)"
     HOSTNAME_PUBLIC="$(conf HOSTNAME)"
+    ALIASES="$(conf ALIASES)"
+    REDIRECTS="$(conf REDIRECTS)"
+    NOINDEX="$(conf NOINDEX false)"
     PUBLIC_PATH="$(conf PUBLIC_PATH /)"
     NETWORKS="$(conf NETWORKS studio)"
     MEM_LIMIT="$(conf MEM_LIMIT 256m)"
@@ -106,10 +143,19 @@ load_app_conf() {
 
     require_match IMAGE "$IMAGE" '^[a-z0-9][a-z0-9.-]*(:[0-9]{1,5})?(/[a-z0-9._-]+)+$'
     require_match CONTAINER_PORT "$PORT" '^[0-9]{2,5}$'
-    require_match HEALTH_PATH "$HEALTH_PATH" '^/[A-Za-z0-9._/-]*$'
-    require_match RELEASE_PATH "$RELEASE_PATH" '^/[A-Za-z0-9._/-]*$'
+    require_match HEALTH_PATH "$HEALTH_PATH" '^(/[A-Za-z0-9._/-]*)?$'
+    require_match RELEASE_PATH "$RELEASE_PATH" '^(/[A-Za-z0-9._/-]*)?$'
     require_match RELEASE_KEY "$RELEASE_KEY" '^[A-Za-z0-9_]+$'
-    require_match HOSTNAME "$HOSTNAME_PUBLIC" '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$'
+    load_domains
+    require_match RELEASE_TIMEOUT "$RELEASE_TIMEOUT" '^[0-9]{1,5}$'
+    require_match OVERLAP "$OVERLAP" '^(true|false)$'
+    require_match STARTUP_SECONDS "$STARTUP_SECONDS" '^[0-9]{1,4}$'
+    [[ "$RELEASE_COMMAND" != *$'\n'* ]] || die "RELEASE_COMMAND must be one line"
+    if [[ -n "$VOLUMES" ]]; then
+        # Named volumes only, and only the app's own: never a host path, never
+        # another app's data.
+        require_match VOLUMES "$VOLUMES" "^$APP-[a-z0-9_.-]+:/[A-Za-z0-9._/-]+(:ro)?(,$APP-[a-z0-9_.-]+:/[A-Za-z0-9._/-]+(:ro)?)*\$"
+    fi
     require_match PUBLIC_PATH "$PUBLIC_PATH" '^/[A-Za-z0-9._/-]*$'
     require_match NETWORKS "$NETWORKS" '^[a-z0-9_-]+(,[a-z0-9_-]+)*$'
     require_match MEM_LIMIT "$MEM_LIMIT" '^[0-9]+[mg]$'
@@ -124,7 +170,8 @@ load_app_conf() {
     SITE_FILE="$SITES_DIR/$APP-$ENV_NAME.caddy"
     BASE="$APP-$ENV_NAME"
     NET="${NETWORKS%%,*}"
-    [[ -f "$TEMPLATE" ]] || die "Missing site template: $TEMPLATE"
+    [[ "$KIND" == web ]] || return 0   # only a public web app has an edge site
+    [[ -f "$TEMPLATE" ]] || return 0   # the usual case: the site is generated from the domains
     [[ "$(grep -c '{{UPSTREAM}}' "$TEMPLATE")" -ge 1 ]] || die "Template has no {{UPSTREAM}}: $TEMPLATE"
     # Without these, a request that resolves the alias to a release that is
     # just stopping hangs until a long default timeout instead of retrying the
@@ -132,6 +179,164 @@ load_app_conf() {
     if ! grep -q 'lb_try_duration' "$TEMPLATE" || ! grep -q 'dial_timeout' "$TEMPLATE"; then
         die "Template's reverse_proxy must set lb_try_duration and dial_timeout: $TEMPLATE"
     fi
+    # The declared domains are what ownership and the checks use, so a template
+    # must serve exactly those: no more (an undeclared domain escapes the
+    # ownership check), no fewer (a declared one would never be served).
+    local served wanted
+    served="$(sed "s/{{HOSTNAME}}/$HOSTNAME_PUBLIC/g" "$TEMPLATE" | site_addresses - | sort -u)"
+    wanted="$(printf '%s\n' "${DOMAINS[@]}" | sort -u)"
+    [[ "$served" == "$wanted" ]] ||
+        die "Template $TEMPLATE serves [$(paste -sd' ' <<<"$served")] but the settings declare [$(paste -sd' ' <<<"$wanted")]; make HOSTNAME/ALIASES/REDIRECTS match it"
+}
+
+# ── Domains ──────────────────────────────────────────────────────────────────
+# A web app has one primary domain (HOSTNAME), optional ALIASES served the same
+# way, and optional REDIRECTS sent permanently to the primary (www.example.com).
+# Different products naturally have different domains; within the server, each
+# domain belongs to exactly one app/env.
+
+readonly DOMAIN_RE='[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+'
+DOMAINS=()
+
+load_domains() {
+    DOMAINS=()
+    if [[ "$KIND" != web ]]; then
+        [[ -z "$HOSTNAME_PUBLIC$ALIASES$REDIRECTS" ]] ||
+            die "Only KIND=web has public domains; remove HOSTNAME/ALIASES/REDIRECTS from this $KIND app"
+        return 0
+    fi
+    require_match HOSTNAME "$HOSTNAME_PUBLIC" "^$DOMAIN_RE\$"
+    require_match ALIASES "$ALIASES" "^($DOMAIN_RE(,$DOMAIN_RE)*)?\$"
+    require_match REDIRECTS "$REDIRECTS" "^($DOMAIN_RE(,$DOMAIN_RE)*)?\$"
+    require_match NOINDEX "$NOINDEX" '^(true|false)$'
+    local d
+    DOMAINS=("$HOSTNAME_PUBLIC")
+    for d in ${ALIASES//,/ } ${REDIRECTS//,/ }; do DOMAINS+=("$d"); done
+    d="$(printf '%s\n' "${DOMAINS[@]}" | sort | uniq -d | paste -sd' ')"
+    [[ -z "$d" ]] || die "Domain declared more than once: $d"
+}
+
+site_addresses() {   # site_addresses <file|->: the host names a Caddyfile's top-level blocks serve
+    python3 -c '
+import re, sys
+text = sys.stdin.read() if sys.argv[1] == "-" else open(sys.argv[1]).read()
+depth = 0
+for raw in text.splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    if depth == 0 and line.endswith("{") and not line.startswith("("):
+        for a in re.split(r"[\s,]+", line[:-1].strip()):
+            if a:
+                a = re.sub(r"^[a-z]+://", "", a).split("/", 1)[0]
+                print(re.sub(r":[0-9]+$", "", a).lower())
+    depth += line.count("{") - line.count("}")
+' "$1"
+}
+
+declared_domains() {   # declared_domains <conf file>: its HOSTNAME, ALIASES, REDIRECTS, one per line
+    sed -nE 's/^(HOSTNAME|ALIASES|REDIRECTS)="?([^"]*)"?[[:space:]]*$/\2/p' "$1" | tr ',' '\n' | sed '/^$/d'
+}
+
+# Refuse a domain that another registered app/env, or the platform's own sites
+# (/etc/algo3/caddy/platform), already claims. Caddy would also refuse the
+# duplicate, but only at reload time and as an "ambiguous site definition".
+# Checked on deploy only: another app's mistake must never block a rollback.
+check_domain_ownership() {
+    [[ "$KIND" == web ]] || return 0
+    local f owner d mine platform
+    for f in "$ETC"/apps/*/*.conf; do
+        [[ -f "$f" ]] || continue
+        owner="$(basename "$(dirname "$f")")/$(basename "$f" .conf)"
+        [[ "$owner" == "$APP/$ENV_NAME" ]] && continue
+        while IFS= read -r d; do
+            for mine in "${DOMAINS[@]}"; do
+                [[ "$d" == "$mine" ]] &&
+                    die "$mine is already claimed by $owner ($f); a domain belongs to exactly one app and environment"
+            done
+        done < <(declared_domains "$f")
+    done
+    platform="$(dirname "$SITES_DIR")/platform"
+    for f in "$platform"/*.caddy; do
+        [[ -f "$f" ]] || continue
+        while IFS= read -r d; do
+            for mine in "${DOMAINS[@]}"; do
+                [[ "$d" == "$mine" ]] && die "$mine is already served by the platform ($f)"
+            done
+        done < <(site_addresses "$f")
+    done
+}
+
+DNS_PROBLEMS=()
+check_dns() {   # warn about domains whose DNS does not point at this server
+    DNS_PROBLEMS=()
+    [[ "$KIND" == web && -n "$SERVER_IPS" ]] || return 0
+    command -v getent >/dev/null || { log "WARNING: getent unavailable; DNS not checked"; return 0; }
+    local d ips ip p stray
+    for d in "${DOMAINS[@]}"; do
+        ips="$(getent ahosts "$d" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd, - || true)"
+        if [[ -z "$ips" ]]; then
+            DNS_PROBLEMS+=("$d does not resolve")
+            continue
+        fi
+        # Every address must be ours: Let's Encrypt may validate over any of
+        # them (it prefers IPv6), and visitors land on all of them.
+        stray=""
+        for ip in ${ips//,/ }; do
+            [[ ",$SERVER_IPS," == *",$ip,"* ]] || stray+="${stray:+,}$ip"
+        done
+        [[ -z "$stray" ]] || DNS_PROBLEMS+=("$d resolves to $stray, which is not this server ($SERVER_IPS)")
+    done
+    for p in "${DNS_PROBLEMS[@]}"; do
+        log "WARNING: DNS: $p. Its certificate cannot be issued until its A/AAAA records point here."
+    done
+}
+
+dns_hint() {   # appended to a failed public check: the likely reason
+    [[ ${#DNS_PROBLEMS[@]} -gt 0 ]] || return 0
+    printf '. DNS: %s' "$(printf '%s; ' "${DNS_PROBLEMS[@]}")"
+}
+
+# The primary domain is THE check (public_serves). Aliases and redirects are
+# checked too, but only warn: they serve the same release, so a failure there is
+# DNS or a certificate still being issued, which rolling back cannot fix.
+DOMAIN_WARNINGS=0
+check_other_domains() {
+    DOMAIN_WARNINGS=0
+    local d i out attempts=$(( ATTEMPTS < 10 ? ATTEMPTS : 10 )) good
+    for d in ${ALIASES//,/ }; do
+        good=false
+        for ((i = 1; i <= attempts; i++)); do
+            if curl --fail --silent --max-time 5 --resolve "$d:$PUBLIC_PORT:$PUBLIC_IP" \
+                    "https://$d:$PUBLIC_PORT$PUBLIC_PATH" >/dev/null 2>&1; then
+                good=true; break
+            fi
+            sleep "$RETRY_SECONDS"
+        done
+        if [[ "$good" == true ]]; then
+            log "https://$d (alias) answers"
+        else
+            DOMAIN_WARNINGS=$((DOMAIN_WARNINGS + 1))
+            log "WARNING: https://$d (alias) does not answer: check its DNS and certificate"
+        fi
+    done
+    for d in ${REDIRECTS//,/ }; do
+        good=false
+        for ((i = 1; i <= attempts; i++)); do
+            out="$(curl --silent --max-time 5 --resolve "$d:$PUBLIC_PORT:$PUBLIC_IP" -o /dev/null \
+                --write-out '%{http_code} %{redirect_url}' "https://$d:$PUBLIC_PORT/" 2>/dev/null || true)"
+            if [[ "$out" == "301 https://$HOSTNAME_PUBLIC/" || "$out" == "308 https://$HOSTNAME_PUBLIC/" ]]; then
+                good=true; break
+            fi
+            sleep "$RETRY_SECONDS"
+        done
+        if [[ "$good" == true ]]; then
+            log "https://$d redirects to https://$HOSTNAME_PUBLIC/"
+        else
+            DOMAIN_WARNINGS=$((DOMAIN_WARNINGS + 1))
+            log "WARNING: https://$d does not redirect to https://$HOSTNAME_PUBLIC/ (got '${out:-no answer}'): check its DNS and certificate"
+        fi
+    done
 }
 
 # ── Docker helpers ───────────────────────────────────────────────────────────
@@ -164,7 +369,85 @@ set_alias() {   # set_alias <container> on|off
 }
 
 edge_fetch() {   # edge_fetch <container> <path> → body on stdout
-    docker exec "$EDGE" wget -q -O - -T 5 "http://$1:$PORT$2" 2>/dev/null
+    if [[ "$NET" == "$EDGE_NET" ]]; then
+        docker exec "$EDGE" wget -q -O - -T 5 "http://$1:$PORT$2" 2>/dev/null
+    else
+        # The app lives on another network (e.g. its own, beside its database):
+        # check it from a throwaway container on THAT network, using the edge's
+        # image (already on the machine, and it has wget).
+        [[ -n "${CHECKER_IMAGE:-}" ]] || CHECKER_IMAGE="$(docker inspect --format '{{.Config.Image}}' "$EDGE")"
+        docker run --rm --network "$NET" --entrypoint wget "$CHECKER_IMAGE" \
+            -q -O - -T 5 "http://$1:$PORT$2" 2>/dev/null
+    fi
+}
+
+# The running container is exactly the image that was asked for: the same
+# image ID as IMAGE@digest. Works for any app, with or without a release marker.
+image_matches() {   # image_matches <container> <digest>
+    local want have
+    want="$(docker image inspect --format '{{.Id}}' "$IMAGE@$2" 2>/dev/null)" || return 1
+    have="$(docker inspect --format '{{.Image}}' "$1" 2>/dev/null)" || return 1
+    [[ -n "$want" && "$want" == "$have" ]]
+}
+
+# RELEASE_COMMAND (migrations, cache warm-up…) runs ONCE from the new image,
+# before it takes any traffic, with the app's secrets, networks and volumes.
+# Parsed without a shell: the first word becomes the entrypoint, so it works
+# whatever the image's own ENTRYPOINT is; use `sh -c '…'` for shell features.
+#
+# It is parsed at the start of a deploy, so a typo such as an unclosed quote is
+# refused before anything is pulled, with the parser's own reason. Python's
+# exit status is checked directly: `while read … done < <(python …)` hides it.
+RELEASE_ARGV=()
+parse_release_command() {
+    RELEASE_ARGV=()
+    [[ -n "$RELEASE_COMMAND" ]] || return 0
+    local words reason
+    words="$(mktemp)"
+    if ! reason="$(python3 -c '
+import shlex, sys
+try:
+    words = shlex.split(sys.argv[1])
+except ValueError as e:
+    sys.stderr.write(str(e)); sys.exit(2)
+sys.stdout.buffer.write(b"".join(w.encode() + b"\0" for w in words))
+' "$RELEASE_COMMAND" 2>&1 >"$words")"; then
+        rm -f "$words"
+        die "RELEASE_COMMAND cannot be parsed (${reason:-unknown error}): $RELEASE_COMMAND"
+    fi
+    mapfile -d '' -t RELEASE_ARGV <"$words"
+    rm -f "$words"
+    [[ ${#RELEASE_ARGV[@]} -gt 0 ]] || die "RELEASE_COMMAND has no command word: $RELEASE_COMMAND"
+}
+
+run_release_command() {   # run_release_command <sha> <digest>
+    [[ ${#RELEASE_ARGV[@]} -gt 0 ]] || return 0
+    local name="$BASE-release-${1:0:12}" rc=0
+    local -a argv=("${RELEASE_ARGV[@]}")
+    local -a args=(run --name "$name" --memory "$MEM_LIMIT" --cpus "$CPUS"
+        --label "algo3.release-command=$APP/$ENV_NAME"
+        --network "$NET" --entrypoint "${argv[0]}")
+    [[ -f "$ENV_FILE" ]] && args+=(--env-file "$ENV_FILE")
+    volume_args args
+    args+=("$IMAGE@$2" "${argv[@]:1}")
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    log "Running the release command: $RELEASE_COMMAND"
+    timeout "$RELEASE_TIMEOUT" docker "${args[@]}" 2>&1 | sed 's/^/    /' || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        docker rm -f "$name" >/dev/null 2>&1 || true
+        die "Release command failed (exit $rc); nothing was switched, the live release is untouched"
+    fi
+    rc="$(docker inspect --format '{{.State.ExitCode}}' "$name" 2>/dev/null || echo 1)"
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    [[ "$rc" == 0 ]] || die "Release command exited $rc; nothing was switched, the live release is untouched"
+}
+
+volume_args() {   # volume_args <array-name>: append --volume for each VOLUMES entry
+    local -n out="$1"
+    local entry
+    [[ -n "$VOLUMES" ]] || return 0
+    IFS=',' read -r -a vols <<<"$VOLUMES"
+    for entry in "${vols[@]}"; do out+=(--volume "$entry"); done
 }
 
 json_key_equals() {   # stdin JSON; exit 0 when .<key> == <expected>
@@ -205,9 +488,30 @@ set_live() {   # set_live <container>
 render_site() {   # render_site <dest>
     {
         printf '# algo3: app=%s env=%s upstream=%s\n' "$APP" "$ENV_NAME" "$BASE"
-        printf '# Written by algo3-deploy from %s. Edit the template, not this file.\n' "$TEMPLATE"
-        sed "s/{{UPSTREAM}}/$BASE:$PORT/g" "$TEMPLATE"
+        if [[ -f "$TEMPLATE" ]]; then
+            printf '# Written by algo3-deploy from %s. Edit the template, not this file.\n' "$TEMPLATE"
+            sed -e "s/{{UPSTREAM}}/$BASE:$PORT/g" -e "s/{{HOSTNAME}}/$HOSTNAME_PUBLIC/g" "$TEMPLATE"
+        else
+            render_generated_site
+        fi
     } > "$1"
+}
+
+# The standard site, from the domain settings. The retry settings are the ones
+# zero-downtime switching depends on (see the header): a connection that hits a
+# release as it stops gives up within 300 ms and is retried on the new one.
+render_generated_site() {
+    local served="$HOSTNAME_PUBLIC" d
+    printf '# Generated by algo3-deploy from %s (HOSTNAME, ALIASES, REDIRECTS, NOINDEX).\n' \
+        "$ETC/apps/$APP/$ENV_NAME.conf"
+    [[ -n "$ALIASES" ]] && served+=", ${ALIASES//,/, }"
+    printf '%s {\n\tencode zstd gzip\n' "$served"
+    [[ "$NOINDEX" == true ]] && printf '\theader X-Robots-Tag "noindex, nofollow, noarchive"\n'
+    printf '\treverse_proxy %s {\n\t\tlb_try_duration 5s\n\t\tlb_try_interval 50ms\n' "$BASE:$PORT"
+    printf '\t\ttransport http {\n\t\t\tdial_timeout 300ms\n\t\t}\n\t}\n}\n'
+    for d in ${REDIRECTS//,/ }; do
+        printf '\n%s {\n\tredir https://%s{uri} permanent\n}\n' "$d" "$HOSTNAME_PUBLIC"
+    done
 }
 
 validate_with() {   # validate_with <candidate site file>
@@ -245,7 +549,7 @@ ensure_site() {   # write + validate + reload, only if the rendered site changed
     fi
     if ! validate_with "$candidate"; then
         rm -f "$candidate"
-        die "Edge rejected the site configuration rendered from $TEMPLATE"
+        die "Edge rejected the site configuration for $APP/$ENV_NAME ($( [[ -f "$TEMPLATE" ]] && echo "from $TEMPLATE" || echo generated ))"
     fi
     # One edge, many apps: serialise configuration changes across all of them.
     exec 8>"$LOCK_DIR/edge.lock"
@@ -265,8 +569,12 @@ ensure_site() {   # write + validate + reload, only if the rendered site changed
 
 # ── Checks ───────────────────────────────────────────────────────────────────
 
-wait_ready() {   # wait_ready <container>: docker health (if any) + HTTP via the edge
-    local name="$1" i status health
+wait_ready() {   # wait_ready <container>
+    # Ready means, in order of what the app offers:
+    #   an HTTP health path          → it answers (and Docker health is not failing)
+    #   a Docker HEALTHCHECK         → Docker reports healthy
+    #   neither (e.g. a plain worker) → it stays running for STARTUP_SECONDS
+    local name="$1" i status health up_since="" restarts=""
     for ((i = 1; i <= ATTEMPTS; i++)); do
         status="$(c_status "$name")"
         if [[ "$status" == "exited" || "$status" == "dead" || -z "$status" ]]; then
@@ -279,8 +587,23 @@ wait_ready() {   # wait_ready <container>: docker health (if any) + HTTP via the
             log "Container $name reports unhealthy"
             return 1
         fi
-        if [[ "$health" != "starting" ]] && edge_fetch "$name" "$HEALTH_PATH" >/dev/null; then
-            return 0
+        if [[ -n "$HEALTH_PATH" ]]; then
+            if [[ "$health" != "starting" ]] && edge_fetch "$name" "$HEALTH_PATH" >/dev/null; then
+                return 0
+            fi
+        elif [[ "$health" != "none" ]]; then
+            [[ "$health" == "healthy" ]] && return 0
+        else
+            # No health signal at all: running continuously, without restarting,
+            # for STARTUP_SECONDS.
+            local now count
+            now="$(date +%s)"
+            count="$(docker inspect --format '{{.RestartCount}}' "$name" 2>/dev/null || echo 0)"
+            if [[ "$status" == running && -n "$up_since" && "$count" == "$restarts" ]]; then
+                (( now - up_since >= STARTUP_SECONDS )) && return 0
+            else
+                up_since="$now"; restarts="$count"
+            fi
         fi
         sleep "$RETRY_SECONDS"
     done
@@ -296,12 +619,16 @@ public_serves() {   # public_serves <sha>: through the real edge, TLS included
     local sha="$1" i
     for ((i = 1; i <= ATTEMPTS; i++)); do
         if curl --fail --silent --max-time 5 --resolve "$HOSTNAME_PUBLIC:$PUBLIC_PORT:$PUBLIC_IP" \
-                "https://$HOSTNAME_PUBLIC:$PUBLIC_PORT$PUBLIC_PATH" >/dev/null 2>&1 &&
-           curl --fail --silent --max-time 5 --resolve "$HOSTNAME_PUBLIC:$PUBLIC_PORT:$PUBLIC_IP" \
-                --header 'Cache-Control: no-cache' \
-                "https://$HOSTNAME_PUBLIC:$PUBLIC_PORT$RELEASE_PATH" 2>/dev/null |
-                json_key_equals "$RELEASE_KEY" "$sha"; then
-            return 0
+                "https://$HOSTNAME_PUBLIC:$PUBLIC_PORT$PUBLIC_PATH" >/dev/null 2>&1; then
+            # Without a release marker, answering is the check (the old release
+            # is stopped by now, so only the new one can answer).
+            [[ -z "$RELEASE_PATH" ]] && return 0
+            if curl --fail --silent --max-time 5 --resolve "$HOSTNAME_PUBLIC:$PUBLIC_PORT:$PUBLIC_IP" \
+                    --header 'Cache-Control: no-cache' \
+                    "https://$HOSTNAME_PUBLIC:$PUBLIC_PORT$RELEASE_PATH" 2>/dev/null |
+                    json_key_equals "$RELEASE_KEY" "$sha"; then
+                return 0
+            fi
         fi
         sleep "$RETRY_SECONDS"
     done
@@ -405,14 +732,19 @@ recover() {
     exit "$rc"
 }
 
-make_live() {   # make_live <container> <sha>: target is running WITHOUT the alias
-    local target="$1" sha="$2"
+make_live() {   # make_live <container> <sha> <digest>: target is running WITHOUT the alias
+    local target="$1" sha="$2" digest="$3"
     wait_ready "$target" || die "$target failed its readiness check"
-    marker_matches "$target" "$sha" || die "$target does not report release $sha at $RELEASE_PATH"
+    image_matches "$target" "$digest" || die "$target is not running image $IMAGE@$digest"
+    if [[ -n "$RELEASE_PATH" ]]; then
+        marker_matches "$target" "$sha" || die "$target does not report release $sha at $RELEASE_PATH"
+    fi
 
-    # From here the target receives traffic alongside the previous release.
-    set_alias "$target" on || die "Could not give $target the alias $BASE"
-    ensure_site
+    if [[ "$KIND" != worker ]]; then
+        # From here the target receives traffic alongside the previous release.
+        set_alias "$target" on || die "Could not give $target the alias $BASE"
+    fi
+    [[ "$KIND" == web ]] && ensure_site
 
     if [[ -n "$PREVIOUS" && "$PREVIOUS" != "$target" ]]; then
         # Set even when the previous release had already stopped (crashed):
@@ -425,7 +757,14 @@ make_live() {   # make_live <container> <sha>: target is running WITHOUT the ali
         fi
     fi
 
-    public_serves "$sha" || die "https://$HOSTNAME_PUBLIC does not serve release $sha"
+    if [[ "$KIND" == web ]]; then
+        public_serves "$sha" || die "https://$HOSTNAME_PUBLIC does not serve release $sha$(dns_hint)"
+        check_other_domains
+    else
+        # No public address to check: the target must still be ready now that
+        # it carries the load alone.
+        wait_ready "$target" || die "$target stopped being ready after the switch"
+    fi
     set_live "$target"
 }
 
@@ -436,6 +775,19 @@ retire() {   # keep exactly one rollback: remove everything but live + previous
         log "Removing release older than the retained rollback: $name"
         docker rm -f "$name" >/dev/null || log "WARNING: could not remove $name"
     done < <(app_containers)
+}
+
+# OVERLAP=false: two copies must never run at once (a scheduler, a singleton
+# worker, an app holding an exclusive file lock). Stop the old one FIRST; for
+# a web app this costs a few seconds that Caddy's retries (lb_try_duration)
+# largely absorb. Recovery restarts it if the new one fails.
+stop_first_if_no_overlap() {
+    [[ "$OVERLAP" == false && -n "$PREVIOUS" && "$PREVIOUS" != "$TARGET" ]] || return 0
+    PREVIOUS_STOPPED=true
+    if [[ "$(c_status "$PREVIOUS")" == "running" ]]; then
+        log "OVERLAP=false: stopping $PREVIOUS before starting $TARGET"
+        docker stop --time 15 "$PREVIOUS" >/dev/null || die "Could not stop $PREVIOUS"
+    fi
 }
 
 start_release() {   # create the target container, without the alias
@@ -453,6 +805,7 @@ start_release() {   # create the target container, without the alias
         IFS=',' read -r -a tmpfs_paths <<<"$TMPFS"
         for path in "${tmpfs_paths[@]}"; do args+=(--tmpfs "$path"); done
     fi
+    volume_args args
     args+=("$IMAGE@$digest")
     TARGET_WAS_NEW=true
     log "Starting $TARGET"
@@ -472,6 +825,10 @@ cmd_deploy() {
     require_match sha "$sha" '^[0-9a-f]{40}$'
     [[ -z "$digest" ]] || require_match digest "$digest" '^sha256:[0-9a-f]{64}$'
     ACTION=deploy; TARGET_SHA="$sha"; TARGET_DIGEST="$digest"
+    # Here, not in the settings: a typo in it must never block a rollback.
+    parse_release_command
+    check_domain_ownership
+    check_dns
 
     if [[ -n "$PROMOTE_FROM" ]]; then
         [[ -n "$digest" ]] || die "$ENV_NAME only accepts promoted releases: a digest is required"
@@ -483,8 +840,13 @@ cmd_deploy() {
     TARGET="$BASE-${sha:0:12}"
 
     if [[ "$PREVIOUS" == "$TARGET" && "$(c_status "$TARGET")" == "running" ]]; then
-        ensure_site
-        public_serves "$sha" || die "$TARGET is live but the public check fails"
+        if [[ "$KIND" == web ]]; then
+            ensure_site
+            public_serves "$sha" || die "$TARGET is live but the public check fails$(dns_hint)"
+            check_other_domains
+        else
+            wait_ready "$TARGET" || die "$TARGET is live but not ready"
+        fi
         DONE=true
         log "Release $sha is already live on $APP/$ENV_NAME"
         record deploy noop "$sha" "$digest" already-live
@@ -504,25 +866,32 @@ cmd_deploy() {
         TARGET_DIGEST="$digest"
     fi
 
+    if c_exists "$TARGET" && [[ "$(c_label "$TARGET" algo3.digest)" != "$digest" ]]; then
+        die "$TARGET exists with a different digest; inspect it before retrying"
+    fi
+
+    # Migrations etc. run while the previous release still serves. Failure
+    # stops here: nothing has been started or switched.
+    run_release_command "$sha" "$digest"
+
+    stop_first_if_no_overlap
+
     if c_exists "$TARGET"; then
-        if [[ "$(c_label "$TARGET" algo3.digest)" != "$digest" ]]; then
-            die "$TARGET exists with a different digest; inspect it before retrying"
-        fi
         log "Reusing retained container $TARGET"
         TARGET_WAS_NEW=false
         # A retained release keeps its alias; drop it before starting, so it
         # takes no traffic until it has passed its checks again.
-        set_alias "$TARGET" off
+        [[ "$KIND" == worker ]] || set_alias "$TARGET" off
         docker start "$TARGET" >/dev/null || die "Could not start $TARGET"
     else
         start_release "$sha" "$digest"
     fi
 
-    make_live "$TARGET" "$sha"
+    make_live "$TARGET" "$sha" "$digest"
     retire "$PREVIOUS"
     history_add "$sha" "$digest"
     DONE=true
-    record deploy ok "$sha" "$digest" "previous=${PREVIOUS:-none}"
+    record deploy ok "$sha" "$digest" "previous=${PREVIOUS:-none}$( ((DOMAIN_WARNINGS)) && echo ",domain-warnings=$DOMAIN_WARNINGS" )"
     heartbeat ok
     log "Deployed $APP/$ENV_NAME $sha"
     log "Rollback retained: ${PREVIOUS:-none}"
@@ -542,9 +911,10 @@ cmd_rollback() {
     TARGET_SHA="$sha"; TARGET_DIGEST="$(c_label "$TARGET" algo3.digest)"; TARGET_WAS_NEW=false
 
     log "Rolling $APP/$ENV_NAME back from $PREVIOUS to $TARGET"
-    set_alias "$TARGET" off
+    stop_first_if_no_overlap
+    [[ "$KIND" == worker ]] || set_alias "$TARGET" off
     docker start "$TARGET" >/dev/null || die "Could not start $TARGET"
-    make_live "$TARGET" "$sha"
+    make_live "$TARGET" "$sha" "$TARGET_DIGEST"
     DONE=true
     record rollback ok "$sha" "$TARGET_DIGEST" "from=$PREVIOUS"
     heartbeat ok
@@ -553,7 +923,17 @@ cmd_rollback() {
 
 cmd_status() {
     local name
-    printf 'live: %s\n' "$(live_container)"
+    printf 'kind: %s\nlive: %s\n' "$KIND" "$(live_container)"
+    if [[ "$KIND" == web ]]; then
+        local d
+        printf 'domain: %s (primary)\n' "$HOSTNAME_PUBLIC"
+        for d in ${ALIASES//,/ }; do printf 'domain: %s (alias)\n' "$d"; done
+        for d in ${REDIRECTS//,/ }; do printf 'domain: %s (redirects to %s)\n' "$d" "$HOSTNAME_PUBLIC"; done
+        printf 'site: %s\n' "$( [[ -f "$TEMPLATE" ]] && echo "from template $TEMPLATE" || echo "generated from the settings" )"
+        check_dns
+        [[ -z "$SERVER_IPS" ]] && printf 'dns: not checked (set SERVER_IPS in %s)\n' "$ETC/delivery.conf"
+        [[ -n "$SERVER_IPS" && ${#DNS_PROBLEMS[@]} -eq 0 ]] && printf 'dns: every domain points at this server\n'
+    fi
     while IFS= read -r name; do
         printf '%s  %s  release=%s\n' "$name" "$(c_status "$name")" "$(c_label "$name" algo3.release)"
     done < <(app_containers)

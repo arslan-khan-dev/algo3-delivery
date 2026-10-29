@@ -1,7 +1,7 @@
 # /etc/algo3/delivery.conf — settings shared by every app's deploy.
 # Installed once by install.sh; never overwritten afterwards.
 
-# The edge: studio-platform's Caddy container, on the `studio` network.
+# The edge: the algo3-edge Caddy container (edge/), on the `studio` network.
 EDGE_CONTAINER=studio-caddy
 # Its main Caddyfile, as a path INSIDE the container. It must contain exactly
 # one line: import /etc/algo3/caddy/sites/*.caddy
@@ -22,3 +22,11 @@ PUBLIC_CHECK_PORT=443
 # healthchecks.io check for deploys: pinged on success, /fail on failure.
 # Leave empty until the check exists.
 HEARTBEAT_URL=
+
+# This server's public addresses, comma-separated (IPv4 and, if it has one,
+# IPv6), e.g. SERVER_IPS=203.0.113.10,2001:db8::10
+# Every deploy then checks that each of the app's domains points here, and
+# warns if not: a new domain cannot get its certificate until its DNS does.
+# Leave empty if domains sit behind a proxy (e.g. Cloudflare orange cloud),
+# whose DNS legitimately points elsewhere.
+SERVER_IPS=

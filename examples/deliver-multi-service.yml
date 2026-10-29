@@ -1,0 +1,56 @@
+# A repo that ships several services (e.g. Atlas: an API, a web app and a
+# worker). Copy to <repo>/.github/workflows/deliver.yml.
+#
+# Each service is its own registered app on the server, with its own image,
+# Dockerfile target and promotion record. `needs:` orders them: the API (and
+# its migrations, via RELEASE_COMMAND on the server) goes first, then the
+# services that depend on it.
+name: Deliver
+
+on:
+  push:
+    branches: [staging, main]
+
+concurrency:
+  group: deliver-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  api:
+    uses: arslan-khan-dev/algo3-delivery/.github/workflows/deploy-app.yml@v1
+    permissions: { contents: read, packages: write, deployments: read }
+    secrets: inherit
+    with:
+      app: atlas-api                       # KIND=internal on the server
+      image: ghcr.io/arslan-khan-dev/atlas-api
+      dockerfile: apps/api/Dockerfile
+      container-port: "3000"
+      release-path: /api/health            # returns {"version": "<sha>"}
+      release-key: version
+      validate-image: node:22.23.4-alpine
+      validate-command: corepack enable && pnpm install --frozen-lockfile && pnpm exec nx run api:test
+
+  web:
+    needs: api
+    uses: arslan-khan-dev/algo3-delivery/.github/workflows/deploy-app.yml@v1
+    permissions: { contents: read, packages: write, deployments: read }
+    secrets: inherit
+    with:
+      app: atlas-web                       # KIND=web; its site routes /api/* to atlas-api-<env>
+      image: ghcr.io/arslan-khan-dev/atlas-web
+      dockerfile: apps/web/Dockerfile
+      staging-url: https://staging.atlas.example
+      production-url: https://atlas.example
+
+  worker:
+    needs: api
+    uses: arslan-khan-dev/algo3-delivery/.github/workflows/deploy-app.yml@v1
+    permissions: { contents: read, packages: write, deployments: read }
+    secrets: inherit
+    with:
+      app: atlas-worker                    # KIND=worker, OVERLAP=false if it schedules jobs
+      image: ghcr.io/arslan-khan-dev/atlas-worker
+      dockerfile: apps/api/Dockerfile
+      target: worker                       # same Dockerfile, another stage
+      release-path: ""
+      smoke: none                          # needs runtime secrets to start; the server checks it

@@ -16,6 +16,7 @@ bash lab/rehearse-phase2.sh         # Phase 2, every step, with checks (~5 min)
 bash lab/rehearse-phase2.sh 3       # a single step
 bash lab/rehearse-phase3.sh         # Phase 3: the edge cutover (after phase 2)
 bash lab/rehearse-phase4.sh         # Phase 4: automated deploys + drills (after phase 3)
+bash lab/rehearse-apps.sh           # Node API (web, migration, volume), Python (internal), worker (after phase 3)
 docker exec -it algo3-lab bash      # look around "on the server"
 docker rm -f algo3-lab              # throw it away
 docker run --rm -v "$PWD/server/baseline:/b:ro" -v "$PWD/lab/check-2604.sh:/check.sh:ro" \
@@ -50,6 +51,8 @@ second, and a probe that records nothing fails every check.
 | Phase 4: a staging deploy, seen from production **and** from staging | **0** | 0 |
 | Phase 4: production promotion, rollback | **0** | 0 |
 | Phase 4: three refused deploys (bad marker, unhealthy, missing image) | **0** | 0 |
+| Apps: Node API (web) deploy with a migration, then rollback | **0** | 0 |
+| Apps: a failing migration (refused, R2 keeps serving) | **0** | 0 |
 
 What these numbers changed:
 

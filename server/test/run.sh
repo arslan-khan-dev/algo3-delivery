@@ -57,6 +57,22 @@ no()  { ! "$@"; }
 S=nexwe-website-staging
 P=nexwe-website-production
 
+# nexwe-website's sites are generated from its settings; the template tests
+# give staging a custom template first.
+custom_staging_template() {
+    cat > /etc/algo3/apps/$APP/staging.caddy.tmpl <<'EOF'
+staging.nexwe.app {
+	encode zstd gzip
+	reverse_proxy {{UPSTREAM}} {
+		lb_try_duration 5s
+		transport http {
+			dial_timeout 300ms
+		}
+	}
+}
+EOF
+}
+
 # ── Happy paths ──────────────────────────────────────────────────────────────
 reset "first deploy"
 ok deploy staging "$A"
@@ -84,6 +100,7 @@ unset STUB_WRONG_MARKER
 ok eq "$(routed staging.nexwe.app)" "$S-${A:0:12}"
 
 reset "a template change is validated, then reloaded exactly once"
+custom_staging_template
 deploy staging "$A"
 sed -i 's/encode zstd gzip/encode gzip/' /etc/algo3/apps/$APP/staging.caddy.tmpl
 ok deploy staging "$B"
@@ -92,6 +109,7 @@ ok grep -q "encode gzip$" /etc/algo3/caddy/sites/$APP-staging.caddy
 ok eq "$(routed staging.nexwe.app)" "$S-${B:0:12}"
 
 reset "a template the edge rejects is refused; the old site and release stay"
+custom_staging_template
 deploy staging "$A"
 cp /etc/algo3/caddy/sites/$APP-staging.caddy /tmp/site-before
 sed -i 's/encode zstd gzip/encode gzip/' /etc/algo3/apps/$APP/staging.caddy.tmpl
@@ -103,6 +121,7 @@ ok eq "$(routed staging.nexwe.app)" "$S-${A:0:12}"
 ok eq "$(status_of "$S-${B:0:12}")" absent
 
 reset "an edge reload that fails on a template change is rolled back"
+custom_staging_template
 deploy staging "$A"
 cp /etc/algo3/caddy/sites/$APP-staging.caddy /tmp/site-before
 sed -i 's/encode zstd gzip/encode gzip/' /etc/algo3/apps/$APP/staging.caddy.tmpl
@@ -114,6 +133,7 @@ ok eq "$(routed staging.nexwe.app)" "$S-${A:0:12}"
 ok eq "$(status_of "$S-${B:0:12}")" absent
 
 reset "a template without retry settings is refused"
+custom_staging_template
 sed -i '/lb_try_duration/d' /etc/algo3/apps/$APP/staging.caddy.tmpl
 ok no deploy staging "$A"
 ok has "$STUB_DIR/out" "must set lb_try_duration and dial_timeout"
@@ -279,6 +299,304 @@ ok no grep -q ":443/" "$STUB_DIR/public-urls"
 sed -i 's/^PUBLIC_CHECK_PORT=.*/PUBLIC_CHECK_PORT=443x/' /etc/algo3/delivery.conf
 ok no deploy staging "$B"
 ok has "$STUB_DIR/out" "Invalid PUBLIC_CHECK_PORT"
+
+# ── Any kind of app ──────────────────────────────────────────────────────────
+register() {   # register <app> <env> <KEY=value>...
+    mkdir -p "/etc/algo3/apps/$1"; printf '%s\n' "${@:3}" HEALTH_ATTEMPTS=3 > "/etc/algo3/apps/$1/$2.conf"
+}
+web_template() {   # web_template <app> <env> <hostname>
+    printf '%s {\n\treverse_proxy {{UPSTREAM}} {\n\t\tlb_try_duration 5s\n\t\ttransport http {\n\t\t\tdial_timeout 300ms\n\t\t}\n\t}\n}\n' "$3" \
+        > "/etc/algo3/apps/$1/$2.caddy.tmpl"
+}
+dep() { /usr/local/libexec/algo3-deploy deploy "$@" >"$STUB_DIR/out" 2>&1; }
+holders() { python3 -c '
+import json, sys
+s = json.load(open(sys.argv[1]))
+print("+".join(sorted(n for n, c in s["containers"].items() if c["status"] == "running" and sys.argv[2] in c.get("aliases", []))))
+' "$STUB_DIR/state.json" "$1"; }
+field() { python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["containers"].get(sys.argv[2],{}); print(json.dumps(c.get(sys.argv[3])))' "$STUB_DIR/state.json" "$1" "$2"; }
+
+reset "a container not running the requested image is refused (any kind)"
+deploy staging "$A"
+export STUB_IMAGE_SWAP="$B"
+ok no deploy staging "$B"
+unset STUB_IMAGE_SWAP
+ok has "$STUB_DIR/out" "is not running image"
+ok eq "$(routed staging.nexwe.app)" "$S-${A:0:12}"
+
+reset "web app without a release marker: identity from the image digest alone"
+register demo-web staging IMAGE=reg.example/demo-web HOSTNAME=demo.example RELEASE_PATH=
+web_template demo-web staging demo.example
+ok dep demo-web staging "$A"
+ok dep demo-web staging "$B"
+ok eq "$(holders demo-web-staging)" "demo-web-staging-${B:0:12}"
+ok no grep -q "demo.example.*release.json" "$STUB_DIR/public-urls"
+
+reset "internal service: stable alias, no edge site, no reload"
+register demo-api staging KIND=internal IMAGE=reg.example/demo-api CONTAINER_PORT=3000 HEALTH_PATH=/healthz
+ok dep demo-api staging "$A"
+ok dep demo-api staging "$B"
+ok eq "$(holders demo-api-staging)" "demo-api-staging-${B:0:12}"
+ok eq "$(status_of "demo-api-staging-${A:0:12}")" exited
+ok test ! -e /etc/algo3/caddy/sites/demo-api-staging.caddy
+ok eq "$(reloads)" 0
+
+reset "worker: no alias; ready once it stays up; the old one stops after"
+register demo-jobs staging KIND=worker IMAGE=reg.example/demo-jobs STARTUP_SECONDS=0
+ok dep demo-jobs staging "$A"
+ok dep demo-jobs staging "$B"
+ok eq "$(status_of "demo-jobs-staging-${B:0:12}")" running
+ok eq "$(status_of "demo-jobs-staging-${A:0:12}")" exited
+ok eq "$(field "demo-jobs-staging-${B:0:12}" aliases)" "[]"
+ok grep -q "demo-jobs-staging-${B:0:12} started while demo-jobs-staging-${A:0:12} ran" "$STUB_DIR/overlaps"
+
+reset "worker that crash-loops is refused; the old one keeps working"
+register demo-jobs staging KIND=worker IMAGE=reg.example/demo-jobs STARTUP_SECONDS=0
+dep demo-jobs staging "$A"
+export STUB_CRASHLOOP="$B"
+ok no dep demo-jobs staging "$B"
+unset STUB_CRASHLOOP
+ok eq "$(status_of "demo-jobs-staging-${A:0:12}")" running
+ok eq "$(status_of "demo-jobs-staging-${B:0:12}")" absent
+
+reset "worker with a Docker HEALTHCHECK goes live when Docker says healthy"
+export STUB_HAS_HEALTHCHECK=1
+register demo-jobs staging KIND=worker IMAGE=reg.example/demo-jobs STARTUP_SECONDS=9999
+ok dep demo-jobs staging "$A"
+ok eq "$(status_of "demo-jobs-staging-${A:0:12}")" running
+
+reset "OVERLAP=false: never two copies at once"
+register demo-jobs staging KIND=worker IMAGE=reg.example/demo-jobs STARTUP_SECONDS=0 OVERLAP=false
+dep demo-jobs staging "$A"; rm -f "$STUB_DIR/overlaps"
+ok dep demo-jobs staging "$B"
+ok eq "$(cat "$STUB_DIR/overlaps" 2>/dev/null)" ""
+ok eq "$(status_of "demo-jobs-staging-${A:0:12}")" exited
+ok eq "$(status_of "demo-jobs-staging-${B:0:12}")" running
+
+reset "OVERLAP=false: a failed new release brings the old one back"
+register demo-jobs staging KIND=worker IMAGE=reg.example/demo-jobs STARTUP_SECONDS=0 OVERLAP=false
+dep demo-jobs staging "$A"
+export STUB_CRASHLOOP="$B"
+ok no dep demo-jobs staging "$B"
+unset STUB_CRASHLOOP
+ok eq "$(status_of "demo-jobs-staging-${A:0:12}")" running
+ok has "$STUB_DIR/out" "serving again"
+
+reset "worker rollback"
+register demo-jobs staging KIND=worker IMAGE=reg.example/demo-jobs STARTUP_SECONDS=0
+dep demo-jobs staging "$A"; dep demo-jobs staging "$B"
+ok /usr/local/libexec/algo3-deploy rollback demo-jobs staging
+ok eq "$(status_of "demo-jobs-staging-${A:0:12}")" running
+ok eq "$(status_of "demo-jobs-staging-${B:0:12}")" exited
+
+reset "release command: once, from the NEW image, quoted arguments intact"
+# shellcheck disable=SC2016 # literal command line, parsed by the deployer
+register demo-api staging KIND=internal IMAGE=reg.example/demo-api CONTAINER_PORT=3000 "RELEASE_COMMAND=sh -c 'npx prisma migrate deploy && echo done'"
+ok dep demo-api staging "$A"
+ok eq "$(wc -l < "$STUB_DIR/release-commands")" 1
+ok python3 -c 'import json,sys; r=json.loads(open(sys.argv[1]).readline()); sys.exit(0 if r["argv"]==["sh","-c","npx prisma migrate deploy && echo done"] and r["image"]==sys.argv[2] else 1)' \
+    "$STUB_DIR/release-commands" "reg.example/demo-api@$(digest "$A")"
+ok eq "$(status_of "demo-api-staging-release-${A:0:12}")" absent
+
+reset "a failing release command stops the deploy before the new release starts"
+register demo-api staging KIND=internal IMAGE=reg.example/demo-api CONTAINER_PORT=3000 RELEASE_COMMAND=migrate
+dep demo-api staging "$A"
+export STUB_RELEASE_EXIT=3
+ok no dep demo-api staging "$B"
+unset STUB_RELEASE_EXIT
+ok has "$STUB_DIR/out" "Release command"
+ok eq "$(status_of "demo-api-staging-${B:0:12}")" absent
+ok eq "$(holders demo-api-staging)" "demo-api-staging-${A:0:12}"
+ok eq "$(status_of "demo-api-staging-release-${B:0:12}")" absent
+
+reset "a malformed release command is refused before anything is pulled, with the reason"
+register demo-api staging KIND=internal IMAGE=reg.example/demo-api CONTAINER_PORT=3000 RELEASE_COMMAND=migrate
+dep demo-api staging "$A"
+register demo-api staging KIND=internal IMAGE=reg.example/demo-api CONTAINER_PORT=3000 "RELEASE_COMMAND=node -e \"process.exit(4)"
+ok no dep demo-api staging "$B"
+ok has "$STUB_DIR/out" "RELEASE_COMMAND cannot be parsed (No closing quotation)"
+ok no grep -q "Pulling" "$STUB_DIR/out"
+ok eq "$(holders demo-api-staging)" "demo-api-staging-${A:0:12}"
+
+reset "a malformed release command never blocks a rollback"
+register demo-api staging KIND=internal IMAGE=reg.example/demo-api CONTAINER_PORT=3000 RELEASE_COMMAND=migrate
+dep demo-api staging "$A"; dep demo-api staging "$B"
+register demo-api staging KIND=internal IMAGE=reg.example/demo-api CONTAINER_PORT=3000 "RELEASE_COMMAND=node -e \"process.exit(4)"
+ok /usr/local/libexec/algo3-deploy rollback demo-api staging
+ok eq "$(holders demo-api-staging)" "demo-api-staging-${A:0:12}"
+
+reset "rollback never re-runs the release command"
+register demo-api staging KIND=internal IMAGE=reg.example/demo-api CONTAINER_PORT=3000 RELEASE_COMMAND=migrate
+dep demo-api staging "$A"; dep demo-api staging "$B"
+ok /usr/local/libexec/algo3-deploy rollback demo-api staging
+ok eq "$(wc -l < "$STUB_DIR/release-commands")" 2
+
+reset "volumes: the app's own named volumes reach the release and its release command"
+register demo-api staging KIND=internal IMAGE=reg.example/demo-api CONTAINER_PORT=3000 VOLUMES=demo-api-uploads:/data/uploads RELEASE_COMMAND=migrate
+ok dep demo-api staging "$A"
+ok eq "$(field "demo-api-staging-${A:0:12}" volumes)" '["demo-api-uploads:/data/uploads"]'
+ok grep -q '"volumes": \["demo-api-uploads:/data/uploads"\]' "$STUB_DIR/release-commands"
+
+reset "another app's volume, or any host path, is refused"
+register demo-api staging KIND=internal IMAGE=reg.example/demo-api VOLUMES=nexwe-website-data:/data
+ok no dep demo-api staging "$A"
+ok has "$STUB_DIR/out" "Invalid VOLUMES"
+register demo-api staging KIND=internal IMAGE=reg.example/demo-api VOLUMES=/etc:/host
+ok no dep demo-api staging "$A"
+ok has "$STUB_DIR/out" "Invalid VOLUMES"
+
+reset "kind rules: unknown kind refused, web needs a hostname, internal needs no template"
+register demo staging KIND=batch IMAGE=reg.example/demo
+ok no dep demo staging "$A"
+ok has "$STUB_DIR/out" "Invalid KIND"
+register demo-web staging IMAGE=reg.example/demo-web
+ok no dep demo-web staging "$A"
+ok has "$STUB_DIR/out" "Invalid HOSTNAME"
+register demo-api staging KIND=internal IMAGE=reg.example/demo-api
+ok dep demo-api staging "$A"
+
+reset "an app on its own network is checked from that network"
+register demo-api staging KIND=internal IMAGE=reg.example/demo-api CONTAINER_PORT=3000 NETWORKS=demo-private,studio
+ok dep demo-api staging "$A"
+ok grep -q "^demo-private http://demo-api-staging-${A:0:12}:3000/" "$STUB_DIR/checker-calls"
+
+# ── Domains ──────────────────────────────────────────────────────────────────
+site() { cat "/etc/algo3/caddy/sites/$1.caddy"; }
+
+reset "no template: the site is generated from the settings (nexwe staging: noindex)"
+ok test ! -e /etc/algo3/apps/$APP/staging.caddy.tmpl
+ok deploy staging "$A"
+ok eq "$(routed staging.nexwe.app)" "$S-${A:0:12}"
+ok grep -q 'header X-Robots-Tag "noindex, nofollow, noarchive"' /etc/algo3/caddy/sites/$S.caddy
+ok grep -q 'lb_try_duration 5s' /etc/algo3/caddy/sites/$S.caddy
+ok grep -q 'dial_timeout 300ms' /etc/algo3/caddy/sites/$S.caddy
+
+reset "aliases are served, redirects redirect, and both are checked"
+register demo-web staging IMAGE=reg.example/demo-web HOSTNAME=demo.example ALIASES=demo.example.org,demo.example.net REDIRECTS=www.demo.example RELEASE_PATH=
+ok dep demo-web staging "$A"
+ok eq "$(routed demo.example)" "demo-web-staging-${A:0:12}"
+ok eq "$(routed demo.example.org)" "demo-web-staging-${A:0:12}"
+ok eq "$(routed demo.example.net)" "demo-web-staging-${A:0:12}"
+ok grep -q '^demo.example, demo.example.org, demo.example.net {$' /etc/algo3/caddy/sites/demo-web-staging.caddy
+ok grep -q 'redir https://demo.example{uri} permanent' /etc/algo3/caddy/sites/demo-web-staging.caddy
+ok has "$STUB_DIR/out" "https://demo.example.org (alias) answers"
+ok has "$STUB_DIR/out" "https://www.demo.example redirects to https://demo.example/"
+ok no grep -q 'X-Robots-Tag' /etc/algo3/caddy/sites/demo-web-staging.caddy
+
+reset "different products on different domains live side by side"
+register demo-web staging IMAGE=reg.example/demo-web HOSTNAME=demo.example RELEASE_PATH=
+ok deploy staging "$A"
+ok dep demo-web staging "$B"
+ok eq "$(routed staging.nexwe.app)" "$S-${A:0:12}"
+ok eq "$(routed demo.example)" "demo-web-staging-${B:0:12}"
+ok deploy staging "$C"
+ok eq "$(routed demo.example)" "demo-web-staging-${B:0:12}"
+ok eq "$(reloads)" 2   # one per app's first deploy; deploys themselves never reload
+
+reset "a domain another app already claims is refused, before anything is pulled"
+register demo-web staging IMAGE=reg.example/demo-web HOSTNAME=staging.nexwe.app
+ok no dep demo-web staging "$A"
+ok has "$STUB_DIR/out" "staging.nexwe.app is already claimed by nexwe-website/staging"
+ok no grep -q Pulling "$STUB_DIR/out"
+register demo-web staging IMAGE=reg.example/demo-web HOSTNAME=demo.example REDIRECTS=www.nexwe.app
+ok no dep demo-web staging "$A"
+ok has "$STUB_DIR/out" "www.nexwe.app is already claimed by nexwe-website/production"
+
+reset "a domain the platform serves is refused"
+mkdir -p /etc/algo3/caddy/platform
+printf 'studio.example, api.studio.example {\n\treverse_proxy studio-api:3000\n}\n' > /etc/algo3/caddy/platform/studio.caddy
+register demo-web staging IMAGE=reg.example/demo-web HOSTNAME=demo.example ALIASES=api.studio.example
+ok no dep demo-web staging "$A"
+ok has "$STUB_DIR/out" "api.studio.example is already served by the platform"
+
+reset "another app's mistake never blocks a rollback"
+register demo-web staging IMAGE=reg.example/demo-web HOSTNAME=demo.example RELEASE_PATH=
+dep demo-web staging "$A"; dep demo-web staging "$B"
+register demo-other staging IMAGE=reg.example/demo-other HOSTNAME=demo.example
+ok /usr/local/libexec/algo3-deploy rollback demo-web staging
+ok eq "$(routed demo.example)" "demo-web-staging-${A:0:12}"
+
+reset "domain settings are validated"
+register demo-web staging IMAGE=reg.example/demo-web HOSTNAME=demo.example ALIASES=demo.example
+ok no dep demo-web staging "$A"
+ok has "$STUB_DIR/out" "Domain declared more than once: demo.example"
+register demo-web staging IMAGE=reg.example/demo-web HOSTNAME=demo.example "ALIASES=bad domain.example"
+ok no dep demo-web staging "$A"
+ok has "$STUB_DIR/out" "Invalid ALIASES"
+register demo-api staging KIND=internal IMAGE=reg.example/demo-api HOSTNAME=api.example
+ok no dep demo-api staging "$A"
+ok has "$STUB_DIR/out" "Only KIND=web has public domains"
+
+reset "a custom template must serve exactly the declared domains"
+register demo-web staging IMAGE=reg.example/demo-web HOSTNAME=demo.example ALIASES=demo.example.org RELEASE_PATH=
+web_template demo-web staging demo.example
+ok no dep demo-web staging "$A"
+ok has "$STUB_DIR/out" "serves \[demo.example\] but the settings declare \[demo.example demo.example.org\]"
+web_template demo-web staging "{{HOSTNAME}}, demo.example.org"
+ok dep demo-web staging "$A"
+ok eq "$(routed demo.example.org)" "demo-web-staging-${A:0:12}"
+ok grep -q '^demo.example, demo.example.org {$' /etc/algo3/caddy/sites/demo-web-staging.caddy
+
+reset "an alias without a certificate yet warns, but does not roll back"
+register demo-web staging IMAGE=reg.example/demo-web HOSTNAME=demo.example ALIASES=demo.example.org REDIRECTS=www.demo.example RELEASE_PATH=
+export STUB_DOMAIN_FAIL="demo.example.org www.demo.example"
+ok dep demo-web staging "$A"
+unset STUB_DOMAIN_FAIL
+ok has "$STUB_DIR/out" "WARNING: https://demo.example.org (alias) does not answer"
+ok has "$STUB_DIR/out" "WARNING: https://www.demo.example does not redirect"
+ok eq "$(routed demo.example)" "demo-web-staging-${A:0:12}"
+ok grep -q 'app=demo-web .*result=ok .*domain-warnings=2' /var/log/algo3/deploys.log
+
+reset "DNS that does not point here is reported, and explains a failed public check"
+sed -i 's/^SERVER_IPS=.*/SERVER_IPS=203.0.113.10,2001:db8::10/' /etc/algo3/delivery.conf
+register demo-web staging IMAGE=reg.example/demo-web HOSTNAME=demo.example ALIASES=demo.example.org,new.example RELEASE_PATH=
+export STUB_DNS="demo.example=203.0.113.10,2001:db8::10 demo.example.org=198.51.100.7"
+ok dep demo-web staging "$A"
+ok has "$STUB_DIR/out" "DNS: demo.example.org resolves to 198.51.100.7, which is not this server"
+ok has "$STUB_DIR/out" "DNS: new.example does not resolve"
+ok no grep -q "DNS: demo.example resolves" "$STUB_DIR/out"
+export STUB_PUBLIC_FAIL=1
+ok no dep demo-web staging "$B"
+unset STUB_PUBLIC_FAIL STUB_DNS
+ok has "$STUB_DIR/out" "does not serve release $B. DNS: demo.example.org resolves to 198.51.100.7"
+ok eq "$(routed demo.example)" "demo-web-staging-${A:0:12}"
+
+reset "status lists every domain and its DNS"
+sed -i 's/^SERVER_IPS=.*/SERVER_IPS=203.0.113.10/' /etc/algo3/delivery.conf
+export STUB_DNS="nexwe.app=203.0.113.10 www.nexwe.app=203.0.113.10"
+ok /usr/local/libexec/algo3-deploy status "$APP" production >"$STUB_DIR/out" 2>&1
+unset STUB_DNS
+ok has "$STUB_DIR/out" "domain: nexwe.app (primary)"
+ok has "$STUB_DIR/out" "domain: www.nexwe.app (redirects to nexwe.app)"
+ok has "$STUB_DIR/out" "site: generated from the settings"
+ok has "$STUB_DIR/out" "dns: every domain points at this server"
+
+reset "the installer retires a template the repo no longer has"
+custom_staging_template
+bash "$SRC/install.sh" --app "$APP" >"$STUB_DIR/out" 2>&1
+ok test ! -e /etc/algo3/apps/$APP/staging.caddy.tmpl
+ok ls /etc/algo3/apps/$APP/staging.caddy.tmpl.backup.*
+ok has "$STUB_DIR/out" "retired"
+
+reset "certificate monitoring covers every domain of every web app, nothing else"
+register demo-web staging IMAGE=reg.example/demo-web HOSTNAME=demo.example ALIASES=demo.example.org
+register demo-api staging KIND=internal IMAGE=reg.example/demo-api
+mkdir -p /tmp/netdata-go.d
+ALGO3_X509_CONF=/tmp/netdata-go.d/x509check.conf /usr/local/sbin/algo3-cert-watch >"$STUB_DIR/out" 2>&1
+ok eq "$(grep -c 'source:' /tmp/netdata-go.d/x509check.conf)" 5
+ok grep -q 'source: https://www.nexwe.app:443' /tmp/netdata-go.d/x509check.conf
+ok grep -q 'name: demo_example_org' /tmp/netdata-go.d/x509check.conf
+ALGO3_X509_CONF=/tmp/netdata-go.d/x509check.conf /usr/local/sbin/algo3-cert-watch >"$STUB_DIR/out" 2>&1
+ok has "$STUB_DIR/out" "unchanged"
+rm -rf /tmp/netdata-go.d
+
+reset "certificate monitoring on a fresh server (no apps registered yet) succeeds, empty"
+# Phase 2 runs this before any app exists: "no domains" must not be an error.
+rm -rf /etc/algo3/apps/*
+mkdir -p /tmp/netdata-go.d
+ok env ALGO3_X509_CONF=/tmp/netdata-go.d/x509check.conf /usr/local/sbin/algo3-cert-watch
+ok grep -q '^jobs: \[\]$' /tmp/netdata-go.d/x509check.conf
+rm -rf /tmp/netdata-go.d
 
 reset "conf files are data, not code"
 # shellcheck disable=SC2016 # the literal $(...) is the point: it must NOT run

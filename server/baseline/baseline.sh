@@ -110,6 +110,15 @@ c_ops() {
         put "$here/ops/$f" "$dest/$f" 0644 || true
     done < <(cd "$here/ops" && find netdata -type f | sort)
     once "$here/ops/.env.example" "$dest/.env" 0600
+    # Certificate checks are generated from the app registry (one per domain,
+    # whatever product it belongs to), never copied from this repo.
+    local x509="$dest/netdata/go.d/x509check.conf"
+    [[ -f "$x509" ]] || { printf 'jobs: []\n' > "$x509"; chmod 0644 "$x509"; }
+    if [[ -x /usr/local/sbin/algo3-cert-watch ]]; then
+        /usr/local/sbin/algo3-cert-watch | sed 's/^/  /'
+    else
+        say "x509       no domains yet (install.sh --app <name> adds each app's)"
+    fi
     docker compose -p algo3-ops -f "$dest/compose.yml" config --quiet || die "compose.yml does not validate"
     say "validated  $dest/compose.yml"
     grep -qE '^ALGO3_TELEGRAM_BOT_TOKEN=.+' "$dest/.env" ||

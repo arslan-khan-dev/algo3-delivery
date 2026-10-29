@@ -49,6 +49,7 @@ for f in "$here"/bin/*; do bash -n "$f" || die "Syntax error in $f"; done
 put "$here/bin/algo3-deploy" /usr/local/libexec/algo3-deploy 0755
 put "$here/bin/algo3-deploy-wrapper" /usr/local/sbin/algo3-deploy-wrapper 0755
 put "$here/bin/algo3-deploy-ssh" /usr/local/sbin/algo3-deploy-ssh 0755
+put "$here/bin/algo3-cert-watch" /usr/local/sbin/algo3-cert-watch 0755
 
 echo "sudoers"
 put "$here/etc/sudoers.d/algo3-deploy" /etc/sudoers.d/algo3-deploy 0440 visudo -cf
@@ -73,9 +74,19 @@ if [[ "${1:-}" == "--app" ]]; then
     [[ -d "$here/apps/$app" ]] || die "No registry files for $app in $here/apps"
     echo "Registry: $app"
     install -d -o root -g root -m 0755 "/etc/algo3/apps/$app"
+    shopt -s nullglob
     for f in "$here/apps/$app"/*.conf "$here/apps/$app"/*.caddy.tmpl; do
         put "$f" "/etc/algo3/apps/$app/$(basename "$f")" 0644
     done
+    # A template removed from the repo must not linger here: it would override
+    # the site generated from the domain settings.
+    for f in "/etc/algo3/apps/$app"/*.caddy.tmpl; do
+        [[ -f "$here/apps/$app/$(basename "$f")" ]] && continue
+        mv -f "$f" "$f.backup.$stamp"
+        say "retired    $f (no longer in the repo; kept as $f.backup.$stamp)"
+        changed=$((changed + 1))
+    done
+    shopt -u nullglob
     for conf in "$here/apps/$app"/*.conf; do
         envname="$(basename "$conf" .conf)"
         secrets="/etc/algo3/apps/$app/$envname.env"
@@ -86,8 +97,11 @@ if [[ "${1:-}" == "--app" ]]; then
             say "secrets    $secrets absent (create it only if the app needs runtime secrets)"
         fi
     done
+    echo "Certificate monitoring"
+    /usr/local/sbin/algo3-cert-watch | sed 's/^/  /'
 fi
 
 echo
 echo "Done: $changed file(s) changed."
 echo "Not touched by design: SSH keys and sshd, *.env secrets, Docker, the edge."
+echo "(The one exception: Netdata is restarted when the list of domains to watch changes.)"
