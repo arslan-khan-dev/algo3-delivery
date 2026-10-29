@@ -52,10 +52,17 @@ curl -fsS --resolve nexwe.app:18443:127.0.0.1 https://nexwe.app:18443/release.js
 ```bash
 sudo sed -i '/^EDGE_HTTP_PORT=/d; /^EDGE_HTTPS_PORT=/d' /opt/algo3/edge/.env
 sudo systemctl stop caddy && sudo docker compose -p algo3-edge -f /opt/algo3/edge/compose.yml up -d
+for i in $(seq 1 30); do curl -fsS -o /dev/null https://nexwe.app/ && break; sleep 0.5; done
 for h in nexwe.app staging.nexwe.app; do curl -fsS https://$h/release.json; echo; done
 sudo sed -i 's/^PUBLIC_CHECK_PORT=.*/PUBLIC_CHECK_PORT=443/' /etc/algo3/delivery.conf
 sudo systemctl disable caddy
 ```
+
+The wait loop (line 3) matters. Docker reports the edge "Started" before Caddy
+inside it is listening, so a check in the first milliseconds fails with
+`curl: (7) Failed to connect … after 2 ms` even when the cutover is fine. That
+happened on the real cutover (2026-10-30). The loop tries for up to 15 s and
+continues as soon as the site answers.
 
 **Check from your PC:**
 - `https://nexwe.app` and `https://staging.nexwe.app` load;
