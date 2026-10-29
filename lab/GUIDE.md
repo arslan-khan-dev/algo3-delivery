@@ -335,7 +335,7 @@ The commands are the same, and the steps run in the same order. The differences:
 | How the code arrives | `tar` from the mounted repo | from your PC over SSH (below); **committed code only** |
 | Certificates | local, issued by the lab's own Caddy | Let's Encrypt, copied from the host Caddy at the cutover |
 | Images | `localhost:5000` | `ghcr.io/arslan-khan-dev/…` |
-| Alerts | stand-in at `hc.lab` | healthchecks.io, Telegram, UptimeRobot (real accounts) |
+| Alerts | stand-in at `hc.lab` | healthchecks.io and UptimeRobot, by email (real accounts) |
 | sudo | no password | your password |
 | Approval | none | **steps that affect production need your go-ahead** (marked below) |
 
@@ -355,17 +355,19 @@ git -C algo3-delivery archive --format=tar.gz --prefix=algo3-delivery/ HEAD \
 
 ### Phase 2 on the server
 
-Before you start, create the free alert accounts:
+Before you start, create the free alert accounts. **Every alert arrives by
+email**; there is no mail server on the VPS.
 
-1. **healthchecks.io**: three checks.
+1. **healthchecks.io**: four checks. It emails you when one goes "down".
    - `box`: period 5 min, grace 10 min.
    - `maintenance`: period 1 day, grace 2 h.
-   - `deploys`: period **365 days** (the maximum). Deploys are irregular, so this
-     check isn't there to expect regular pings. A failed deploy pings `/fail`,
-     which alerts immediately; a shorter period would raise a false "down" after
-     any quiet week.
-2. **Telegram**: a bot from @BotFather, and your chat id.
-3. **UptimeRobot**: one HTTPS monitor each for `nexwe.app` and `staging.nexwe.app`.
+   - `deploys`: period **365 days** (the maximum), grace 1 day.
+   - `server-alerts`: period **365 days**, grace 1 day. Netdata pings it.
+
+   The last two receive pings only when something happens, so a long period
+   avoids a false "down" after a quiet week. A ping to `/fail` alerts
+   immediately, whatever the period.
+2. **UptimeRobot**: one HTTPS monitor each for `nexwe.app` and `staging.nexwe.app`.
 
 | Step | On the server, as `algo3` | Approval |
 | --- | --- | --- |
@@ -373,8 +375,8 @@ Before you start, create the free alert accounts:
 | 1 | `sudo install -d -m 0755 /opt/algo3`, then copy to `/opt/algo3/delivery` and `sudo bash /opt/algo3/delivery/server/install.sh` (as in section 8) | |
 | 2 | `cd /opt/algo3/delivery/server/baseline && sudo bash baseline.sh sysctl apt` | |
 | 3 | `sudo bash baseline.sh docker`, **then** `sudo systemctl restart docker` | **yes: ~4 s outage** |
-| 5 | `sudo bash baseline.sh ops timers`. Fill in `/etc/algo3/monitoring.conf` (the two check URLs), `/opt/algo3/ops/.env` (Telegram token and chat id) and `HEARTBEAT_URL` in `/etc/algo3/delivery.conf`. Then `sudo docker compose -p algo3-ops -f /opt/algo3/ops/compose.yml up -d` | |
-| 6 | Check the alerts arrive. healthchecks.io shows the `box` and `maintenance` pings (`sudo systemctl start algo3-heartbeat.service algo3-maintenance-check.service` sends them now). For Telegram, Netdata's own test: `sudo docker exec netdata /usr/libexec/netdata/plugins.d/alarm-notify.sh test`. The lab can't test Telegram, so this is its first real check | |
+| 5 | `sudo bash baseline.sh ops timers`. Fill in `/etc/algo3/monitoring.conf` (the `box` and `maintenance` URLs), `HEARTBEAT_URL` in `/etc/algo3/delivery.conf` (the `deploys` URL) and `ALGO3_ALERTS_CHECK_URL` in `/opt/algo3/ops/.env` (the `server-alerts` URL). Then `sudo docker compose -p algo3-ops -f /opt/algo3/ops/compose.yml up -d` | |
+| 6 | Check the alerts arrive. `sudo systemctl start algo3-heartbeat.service algo3-maintenance-check.service` pings `box` and `maintenance` now; both turn green. Netdata's own test, `sudo docker exec netdata /usr/libexec/netdata/plugins.d/alarm-notify.sh test`, turns `server-alerts` "down" then "up", so you get **two emails** | |
 | 7 | SSH last, below | |
 
 **Step 7, keys only.** Do this in order, and keep your current session open

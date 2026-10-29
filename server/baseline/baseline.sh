@@ -121,8 +121,8 @@ c_ops() {
     fi
     docker compose -p algo3-ops -f "$dest/compose.yml" config --quiet || die "compose.yml does not validate"
     say "validated  $dest/compose.yml"
-    grep -qE '^ALGO3_TELEGRAM_BOT_TOKEN=.+' "$dest/.env" ||
-        say "NOTE: $dest/.env has no Telegram token yet"
+    grep -qE '^ALGO3_ALERTS_CHECK_URL=.+' "$dest/.env" ||
+        say "NOTE: $dest/.env has no ALGO3_ALERTS_CHECK_URL yet (Netdata's email alerts via healthchecks.io)"
     say "Not started. When ready:"
     say "    sudo docker compose -p algo3-ops -f $dest/compose.yml up -d"
 }

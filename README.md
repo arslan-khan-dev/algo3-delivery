@@ -41,7 +41,7 @@ server: ssh (key pinned to one app/env) ─► algo3-deploy-ssh ─► sudo algo
 | `docs/rollout-nexwe-website.md` | Phase 4: GitHub settings, deploy keys, the first automatic deploys |
 | `lab/` | A local stand-in for the VPS. Every server step is rehearsed there first. **Start with `lab/GUIDE.md`**: the step-by-step guide, from the first test to the server |
 | `server/baseline/baseline.sh` | Server baseline, one component at a time: `sysctl`, `apt`, `docker`, `timers`, `ops`, `ssh` |
-| `server/baseline/ops/` | autoheal (restarts unhealthy containers) + Netdata (alerts to Telegram), pinned by digest |
+| `server/baseline/ops/` | autoheal (restarts unhealthy containers) + Netdata (alerts by email, through healthchecks.io), pinned by digest |
 | `server/baseline/bin/` | Heartbeat to healthchecks.io (every 5 min), pending-reboot alert (daily), image prune (weekly; never containers) |
 | `server/baseline/test/baseline-test.sh` | Validates every config with the real tool that reads it, and tests the alert scripts |
 

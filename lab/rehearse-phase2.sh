@@ -88,7 +88,8 @@ step5() {
     run "cd /opt/algo3/delivery/server/baseline && sudo bash baseline.sh ops timers"
     echo "  (filling in the alert settings, as you will with the real URLs)"
     as_root "sed -i 's#^BOX_CHECK_URL=.*#BOX_CHECK_URL=https://hc.lab:8443/ping/box#; s#^MAINTENANCE_CHECK_URL=.*#MAINTENANCE_CHECK_URL=https://hc.lab:8443/ping/maintenance#' /etc/algo3/monitoring.conf
-             sed -i 's#^HEARTBEAT_URL=.*#HEARTBEAT_URL=https://hc.lab:8443/ping/deploys#' /etc/algo3/delivery.conf"
+             sed -i 's#^HEARTBEAT_URL=.*#HEARTBEAT_URL=https://hc.lab:8443/ping/deploys#' /etc/algo3/delivery.conf
+             sed -i 's#^ALGO3_ALERTS_CHECK_URL=.*#ALGO3_ALERTS_CHECK_URL=https://hc.lab:8443/ping/alerts#' /opt/algo3/ops/.env"
     check "monitoring.conf is root-only" 'test "$(stat -c %U:%a /etc/algo3/monitoring.conf)" = root:600'
     check "ops .env is root-only" 'test "$(stat -c %U:%a /opt/algo3/ops/.env)" = root:600'
     run "sudo docker compose -p algo3-ops -f /opt/algo3/ops/compose.yml up -d"
@@ -106,15 +107,23 @@ step5() {
 step6() {
     title "Step 6 · prove every alert path"
     echo "  -- a hung container: unhealthy, labelled autoheal=true --"
-    as_root 'docker rm -f lab-hung >/dev/null 2>&1; docker run -d --name lab-hung --label autoheal=true \
+    as_root ': > /var/log/lab-fakehc.log; docker rm -f lab-hung >/dev/null 2>&1; docker run -d --name lab-hung --label autoheal=true \
                --health-cmd "false" --health-interval 5s --health-retries 1 --health-start-period 1s busybox sleep 3600 >/dev/null
              docker inspect -f "{{.State.StartedAt}}" lab-hung > /tmp/started'
     check "autoheal restarted the unhealthy container" \
         'for i in $(seq 1 60); do [ "$(docker inspect -f "{{.State.StartedAt}}" lab-hung)" != "$(cat /tmp/started)" ] && exit 0; sleep 3; done; exit 1'
-    check "Netdata raised docker_container_unhealthy (it would go to Telegram)" \
+    check "Netdata raised docker_container_unhealthy" \
         'for i in $(seq 1 60); do curl -fs "http://127.0.0.1:19999/api/v1/alarms?all" | grep -q "docker_container_unhealthy" && exit 0; sleep 3; done; exit 1'
+    check "and emailed it: healthchecks.io got /fail naming the alert" \
+        'for i in $(seq 1 60); do grep -qE "POST /ping/alerts/fail (WARNING|CRITICAL) docker_container_unhealthy on " /var/log/lab-fakehc.log && exit 0; sleep 3; done; exit 1'
     check "stock 'container down' alert is gone (stopped rollbacks must not alert)" '! curl -fs "http://127.0.0.1:19999/api/v1/alarms?all" | grep -q docker_container_down'
     as_root 'docker rm -f lab-hung >/dev/null'
+
+    echo; echo "  -- Netdata's own test alert (what you run on the server to check the email arrives) --"
+    as_root ': > /var/log/lab-fakehc.log; docker exec netdata /usr/libexec/netdata/plugins.d/alarm-notify.sh test >/dev/null 2>&1 || true'
+    check "the test sends DOWN (/fail) first" 'grep -q "POST /ping/alerts/fail WARNING" /var/log/lab-fakehc.log'
+    check "and UP (a plain ping) once it clears" 'grep -q "POST /ping/alerts CLEAR" /var/log/lab-fakehc.log'
+    check "the secret check URL never appears in Netdata's log" '! docker logs netdata 2>&1 | grep -q "hc.lab:8443/ping/alerts"'
 
     echo; echo "  -- a pending reboot --"
     as_root ': > /var/log/lab-fakehc.log; printf "linux-image-lab\n" > /var/run/reboot-required.pkgs; touch /var/run/reboot-required; systemctl start algo3-maintenance-check.service'

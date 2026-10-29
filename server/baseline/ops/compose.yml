@@ -27,7 +27,7 @@ services:
 
   # Metrics and alerts for the host and every container: disk, RAM, OOM kills,
   # unhealthy or restart-looping containers, TLS certificate expiry. Alerts go
-  # to Telegram. Local only: no Netdata Cloud, dashboard on 127.0.0.1:19999,
+  # by email, through healthchecks.io (see health_alarm_notify.conf). Local only: no Netdata Cloud, dashboard on 127.0.0.1:19999,
   # reached through an SSH tunnel.
   netdata:
     image: netdata/netdata:v2.12.2@sha256:3d00de3756e1e9150c6121080934168ab5f2ceffce6d494573316c09c18adf83
