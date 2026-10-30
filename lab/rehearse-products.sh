@@ -96,8 +96,8 @@ step3() {
     title "Step 3 · registry + env files, as the operator writes them"
     as_root "mkdir -p /etc/algo3/apps/biruno /etc/algo3/apps/nexwe
       for e in staging production; do
-        sed -e 's#^IMAGE=.*#IMAGE=$REG/biruno-ai#' -e 's#BIRUNO_DOMAIN#$BD#' /lab/algo3-delivery/server/apps/biruno/\$e.conf > /etc/algo3/apps/biruno/\$e.conf
-        cp /lab/algo3-delivery/server/apps/biruno/\$e.caddy.tmpl /etc/algo3/apps/biruno/
+        sed -e 's#^IMAGE=.*#IMAGE=$REG/biruno-ai#' -e 's#birunoai\.com#$BD#g' /lab/algo3-delivery/server/apps/biruno/\$e.conf > /etc/algo3/apps/biruno/\$e.conf
+        sed -e 's#birunoai\.com#$BD#g' /lab/algo3-delivery/server/apps/biruno/\$e.caddy.tmpl > /etc/algo3/apps/biruno/\$e.caddy.tmpl
         sed -e 's#^IMAGE=.*#IMAGE=$REG/nexwe-api#' /lab/algo3-delivery/server/apps/nexwe/\$e.conf > /etc/algo3/apps/nexwe/\$e.conf
         sed -i 's/^HEALTH_ATTEMPTS=.*//' /etc/algo3/apps/*/\$e.conf
       done"
