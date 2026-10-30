@@ -412,7 +412,7 @@ needs approval. Before it, add `SERVER_IPS=<the VPS's public IP>` to
 ### Phase 4 on the server
 
 Follow `docs/rollout-nexwe-website.md`: push algo3-delivery to GitHub with tag
-`v1`, create the GitHub environments and the two deploy keys, then let a push to
+`v1`, create the two deploy keys and the repository secrets and variables, then let a push to
 `staging` deploy. The first merge to `main` deploys production: **ask before
 it.**
 

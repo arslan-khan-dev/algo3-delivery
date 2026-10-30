@@ -4,19 +4,26 @@
 # examples/deliver.yml). What happens:
 #
 #   push staging ─► validate ─► build (image :<sha>, by digest) ─► deploy staging
-#   push main    ─► promote (find the staging deploy with the SAME git tree)
+#                ─► label that image :staging-ok-<sha> once staging verified it
+#   push main    ─► promote (a staging commit with the SAME git tree, whose
+#                   image carries :staging-ok-<sha>)
 #                ─► deploy production with staging's exact image digest
 #
 # Production never rebuilds and never deploys code that did not pass staging.
 # The server enforces the same rule independently (PROMOTE_FROM=staging), so a
 # bug or a compromise in this workflow cannot skip staging on its own.
 #
-# Per-environment settings live in GitHub Environments named
-# `<app>-staging` and `<app>-production`:
-#   secret   DEPLOY_SSH_KEY    private key pinned on the server to that app/env
-#   variable VPS_HOST          server address
-#   variable VPS_KNOWN_HOSTS   the server's host key line (host-key checking is
-#                              never disabled)
+# Settings: repository secrets and variables in the product repo. GitHub Free
+# offers no environments (nor their secrets) in private repositories, so the
+# key names carry the environment instead:
+#   secret   DEPLOY_SSH_KEY_STAGING     private key pinned on the server to <app>/staging
+#   secret   DEPLOY_SSH_KEY_PRODUCTION  private key pinned on the server to <app>/production
+#   variable VPS_HOST                   server address
+#   variable VPS_KNOWN_HOSTS            the server's host key line (host-key
+#                                       checking is never disabled)
+# There is deliberately no shared fallback name: the production job presenting
+# the staging key would make the server deploy staging while the job believes
+# it deployed production.
 name: algo3 deliver
 
 on:
@@ -88,6 +95,16 @@ on:
       production-url:
         type: string
         default: ""
+    secrets:
+      # A one-app repo passes these with `secrets: inherit`. A repo with several
+      # apps maps a different key onto them for each app (keys are pinned to one
+      # app on the server); see examples/deliver-multi-service.yml.
+      DEPLOY_SSH_KEY_STAGING:
+        description: Private key pinned on the server to <app>/staging
+        required: false
+      DEPLOY_SSH_KEY_PRODUCTION:
+        description: Private key pinned on the server to <app>/production
+        required: false
 
 permissions: {}
 
@@ -260,23 +277,22 @@ jobs:
     if: needs.plan.outputs.target == 'staging'
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    permissions: {}
+    permissions:
+      packages: write   # only to add the :staging-ok-<sha> label below
     concurrency:
       group: algo3-${{ inputs.app }}-staging
       cancel-in-progress: false
-    environment:
-      name: ${{ inputs.app }}-staging
-      url: ${{ inputs.staging-url }}
     steps:
       - name: Deploy through the server's forced command
         env:
-          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KEY: ${{ secrets.DEPLOY_SSH_KEY_STAGING }}
+          KEY_NAME: DEPLOY_SSH_KEY_STAGING
           HOST: ${{ vars.VPS_HOST }}
           KNOWN_HOSTS: ${{ vars.VPS_KNOWN_HOSTS }}
           SHA: ${{ github.sha }}
           DIGEST: ${{ needs.build.outputs.digest }}
         run: &deploy |
-          [[ -n "$KEY" && -n "$HOST" && -n "$KNOWN_HOSTS" ]] || { echo "::error::DEPLOY_SSH_KEY, VPS_HOST and VPS_KNOWN_HOSTS must be set on this environment"; exit 1; }
+          [[ -n "$KEY" && -n "$HOST" && -n "$KNOWN_HOSTS" ]] || { echo "::error::Repository secret $KEY_NAME and variables VPS_HOST, VPS_KNOWN_HOSTS must be set"; exit 1; }
           install -d -m 700 ~/.ssh
           printf '%s\n' "$KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
@@ -305,6 +321,21 @@ jobs:
             echo "- URL: $URL"
             echo "- Release: \`$SHA\`"
           } >> "$GITHUB_STEP_SUMMARY"
+      # Reached only when the deploy (and the check from the internet) passed:
+      # this label is what production promotion looks for.
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Label the image as verified on staging
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+          SHA: ${{ github.sha }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          docker buildx imagetools create --tag "$IMAGE:staging-ok-$SHA" "$IMAGE@$DIGEST"
+          echo "Labelled $IMAGE@$DIGEST as staging-ok-$SHA"
 
   promote:
     needs: plan
@@ -313,7 +344,6 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-      deployments: read
       packages: read
     outputs:
       sha: ${{ steps.find.outputs.sha }}
@@ -325,32 +355,32 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       # Compare git TREES, not commit SHAs: a merge commit or a fast-forward of
-      # staging into main both qualify, as long as the code is identical.
+      # staging into main both qualify, as long as the code is identical. The
+      # candidate must also carry :staging-ok-<sha>, which only a successful
+      # staging deploy adds.
       - name: Find the staging deploy of this exact code
         id: find
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
-          ENVIRONMENT: ${{ inputs.app }}-staging
           IMAGE: ${{ needs.plan.outputs.image }}
         run: |
           tree="$(gh api "repos/$REPO/git/commits/$SHA" --jq .tree.sha)"
           echo "main $SHA has tree $tree"
-          found=""
-          while IFS= read -r line; do
-            id="${line%% *}"; candidate="${line##* }"
-            state="$(gh api "repos/$REPO/deployments/$id/statuses?per_page=1" --jq '.[0].state // ""')"
-            [[ "$state" == success ]] || continue
-            [[ "$(gh api "repos/$REPO/git/commits/$candidate" --jq .tree.sha)" == "$tree" ]] || continue
-            found="$candidate"; break
-          done < <(gh api "repos/$REPO/deployments?environment=$ENVIRONMENT&per_page=30" --jq '.[] | "\(.id) \(.sha)"')
+          found=""; digest=""
+          while read -r candidate candidate_tree; do
+            [[ "$candidate_tree" == "$tree" ]] || continue
+            if d="$(docker buildx imagetools inspect "$IMAGE:staging-ok-$candidate" --format '{{json .Manifest}}' 2>/dev/null | jq -r .digest)" &&
+               [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              found="$candidate"; digest="$d"; break
+            fi
+            echo "staging commit $candidate has this code but was never verified on staging"
+          done < <(gh api "repos/$REPO/commits?sha=staging&per_page=50" --jq '.[] | "\(.sha) \(.commit.tree.sha)"')
           if [[ -z "$found" ]]; then
             echo "::error::This code was never deployed successfully to staging. Merge it to staging first; production only promotes tested releases."
             exit 1
           fi
-          digest="$(docker buildx imagetools inspect "$IMAGE:$found" --format '{{json .Manifest}}' | jq -r .digest)"
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image for $found"; exit 1; }
           echo "Promoting staging release $found ($digest)"
           echo "sha=$found" >> "$GITHUB_OUTPUT"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
@@ -364,13 +394,11 @@ jobs:
     concurrency:
       group: algo3-${{ inputs.app }}-production
       cancel-in-progress: false
-    environment:
-      name: ${{ inputs.app }}-production
-      url: ${{ inputs.production-url }}
     steps:
       - name: Deploy through the server's forced command
         env:
-          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KEY: ${{ secrets.DEPLOY_SSH_KEY_PRODUCTION }}
+          KEY_NAME: DEPLOY_SSH_KEY_PRODUCTION
           HOST: ${{ vars.VPS_HOST }}
           KNOWN_HOSTS: ${{ vars.VPS_KNOWN_HOSTS }}
           SHA: ${{ needs.promote.outputs.sha }}

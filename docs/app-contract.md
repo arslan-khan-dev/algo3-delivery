@@ -168,7 +168,7 @@ it from the server, so the generated site takes over again.
 - [ ] On the server: `sudo ./install.sh --app <app>`, plus `<env>.env` (root, 0600) for runtime secrets.
 - [ ] One SSH key per app and environment, added to `~algo3-deploy/.ssh/authorized_keys` as
       `restrict,command="/usr/local/sbin/algo3-deploy-ssh <app> <env>" ssh-ed25519 … ci-<app>-<env>`.
-- [ ] GitHub environments `<app>-staging` and `<app>-production`, each with `DEPLOY_SSH_KEY`, `VPS_HOST` and `VPS_KNOWN_HOSTS`.
+- [ ] Repository secrets `DEPLOY_SSH_KEY_STAGING` and `DEPLOY_SSH_KEY_PRODUCTION`, and variables `VPS_HOST` and `VPS_KNOWN_HOSTS` (GitHub Free has no environments in private repos). A repo with several apps uses one pair of secrets per app and maps them in its workflow (see `examples/deliver-multi-service.yml`).
 - [ ] `.github/workflows/deliver.yml`: copy `examples/deliver.yml`, or `examples/deliver-multi-service.yml` for a repo with several services. Set `validate-image` and `validate-command` for your language's tests.
 - [ ] UptimeRobot monitor for each primary domain. Certificate expiry for **every** domain is watched by Netdata automatically, from the registry.
 - [ ] First staging deploy watched, then the first production promotion.

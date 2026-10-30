@@ -34,30 +34,59 @@ SSH keys.
 
    The fingerprint must be `SHA256:F93NV3c19hWPTV6rrn7SlIHgfCigK4swyCu+arphfwg`. Check it with `ssh-keyscan -t ed25519 <ip> | ssh-keygen -lf -`.
 
-3. **Create the environments.** In `arslan-khan-dev/nexwe-website`, go to **Settings → Environments** and create two:
-   - **`nexwe-website-staging`**
-     - secret `DEPLOY_SSH_KEY`: the **private** staging key (the whole file);
-     - variables `VPS_HOST` (the server IP) and `VPS_KNOWN_HOSTS` (the keyscan line).
-   - **`nexwe-website-production`**
-     - the same three, with the production key;
-     - **Deployment branches: Selected → `main`.**
+3. **Repository secrets and variables.** GitHub Free offers no environments in
+   private repositories, so everything is set at repository level, with the
+   environment in the name. In `arslan-khan-dev/nexwe-website`, go to
+   **Settings → Secrets and variables → Actions**:
+   - **Secrets** tab: `DEPLOY_SSH_KEY_STAGING` (the whole **private** staging
+     key file) and `DEPLOY_SSH_KEY_PRODUCTION` (the production one).
+   - **Variables** tab: `VPS_HOST` (the server IP) and `VPS_KNOWN_HOSTS` (the
+     keyscan line).
+
+   What protects production without environments: the production key can only
+   run `deploy nexwe-website production` (pinned on the server); the server
+   refuses any release staging didn't run with the same digest
+   (`PROMOTE_FROM=staging`); and the workflow's production job runs only for
+   pushes to `main` and only promotes an image labelled `staging-ok-<sha>`.
+   Any workflow in the repo could read the secrets, so give push access only
+   to people you would trust with a deploy.
 
 4. **Delete the private keys** from your PC once they're stored in GitHub.
 
 ## 2 · Server (as `algo3`)
 
-**Prerequisite:** Phase 2 step 7 (SSH lock-down, which allows `algo3-deploy`) must be done.
+Rehearsed in the lab from the server's real state (2026-10-30, 17/17),
+including the full lock-down applied on top afterwards.
+
+**1. Pin the keys.** This **replaces** the old unrestricted
+`github-actions-algo3-deploy` key (kept only as a backup file):
 
 ```bash
-sudo cp -p ~algo3-deploy/.ssh/authorized_keys ~algo3-deploy/.ssh/authorized_keys.backup.$(date +%Y%m%d)
+sudo install -d -m 700 -o algo3-deploy -g algo3-deploy ~algo3-deploy/.ssh
+sudo cp -p ~algo3-deploy/.ssh/authorized_keys ~algo3-deploy/.ssh/authorized_keys.backup.$(date +%Y%m%d) 2>/dev/null || true
 sudo tee ~algo3-deploy/.ssh/authorized_keys >/dev/null <<'EOF'
 restrict,command="/usr/local/sbin/algo3-deploy-ssh nexwe-website staging" ssh-ed25519 AAAA…staging-public-key… ci-nexwe-website-staging
 restrict,command="/usr/local/sbin/algo3-deploy-ssh nexwe-website production" ssh-ed25519 AAAA…production-public-key… ci-nexwe-website-production
 EOF
-sudo chown algo3-deploy: ~algo3-deploy/.ssh/authorized_keys && sudo chmod 600 ~algo3-deploy/.ssh/authorized_keys
+sudo chown algo3-deploy:algo3-deploy ~algo3-deploy/.ssh/authorized_keys && sudo chmod 600 ~algo3-deploy/.ssh/authorized_keys
 ```
 
-This **replaces** the old unrestricted `github-actions-algo3-deploy` key.
+The `install -d` line creates `.ssh` if it is missing (the lab found the
+`tee` fails without it) and is harmless when it exists.
+
+**2. Let `algo3-deploy` through SSH (`AllowUsers`)**, only now, with the old key
+gone; allowing the account while it was still there would give that key a
+shell. The full lock-down (Phase 2 step 7) also does this; on the real server
+that lock-down is the last step, so a minimal drop-in does it for now and is
+replaced (with a backup) by the lock-down later:
+
+```bash
+sudo passwd -S algo3-deploy          # must not say "P" (a usable password); if it does: sudo usermod -p '*' algo3-deploy
+printf '%s\n' "# algo3: let the CI account in (its keys are pinned to a forced command)." \
+  "# Passwords stay on until the full lock-down (baseline.sh ssh) replaces this file." \
+  "AllowUsers zain algo3 algo3-deploy" | sudo tee /etc/ssh/sshd_config.d/10-algo3.conf >/dev/null
+sudo sshd -t && sudo systemctl reload ssh
+```
 
 **Test from your PC.** The key must not run anything:
 

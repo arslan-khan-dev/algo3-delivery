@@ -2,7 +2,9 @@
 # worker). Copy to <repo>/.github/workflows/deliver.yml.
 #
 # Each service is its own registered app on the server, with its own image,
-# Dockerfile target and promotion record. `needs:` orders them: the API (and
+# Dockerfile target, promotion label and deploy keys. Keys are pinned to one
+# app on the server, so each job maps its own pair of repository secrets onto
+# the names the shared workflow expects (no `secrets: inherit` here). `needs:` orders them: the API (and
 # its migrations, via RELEASE_COMMAND on the server) goes first, then the
 # services that depend on it.
 name: Deliver
@@ -18,8 +20,10 @@ concurrency:
 jobs:
   api:
     uses: arslan-khan-dev/algo3-delivery/.github/workflows/deploy-app.yml@v1
-    permissions: { contents: read, packages: write, deployments: read }
-    secrets: inherit
+    permissions: { contents: read, packages: write }
+    secrets:                               # this app's own keys (pinned to it on the server)
+      DEPLOY_SSH_KEY_STAGING: ${{ secrets.DEPLOY_SSH_KEY_ATLAS_API_STAGING }}
+      DEPLOY_SSH_KEY_PRODUCTION: ${{ secrets.DEPLOY_SSH_KEY_ATLAS_API_PRODUCTION }}
     with:
       app: atlas-api                       # KIND=internal on the server
       image: ghcr.io/arslan-khan-dev/atlas-api
@@ -33,8 +37,10 @@ jobs:
   web:
     needs: api
     uses: arslan-khan-dev/algo3-delivery/.github/workflows/deploy-app.yml@v1
-    permissions: { contents: read, packages: write, deployments: read }
-    secrets: inherit
+    permissions: { contents: read, packages: write }
+    secrets:                               # this app's own keys (pinned to it on the server)
+      DEPLOY_SSH_KEY_STAGING: ${{ secrets.DEPLOY_SSH_KEY_ATLAS_WEB_STAGING }}
+      DEPLOY_SSH_KEY_PRODUCTION: ${{ secrets.DEPLOY_SSH_KEY_ATLAS_WEB_PRODUCTION }}
     with:
       app: atlas-web                       # KIND=web; its site routes /api/* to atlas-api-<env>
       image: ghcr.io/arslan-khan-dev/atlas-web
@@ -45,8 +51,10 @@ jobs:
   worker:
     needs: api
     uses: arslan-khan-dev/algo3-delivery/.github/workflows/deploy-app.yml@v1
-    permissions: { contents: read, packages: write, deployments: read }
-    secrets: inherit
+    permissions: { contents: read, packages: write }
+    secrets:                               # this app's own keys (pinned to it on the server)
+      DEPLOY_SSH_KEY_STAGING: ${{ secrets.DEPLOY_SSH_KEY_ATLAS_WORKER_STAGING }}
+      DEPLOY_SSH_KEY_PRODUCTION: ${{ secrets.DEPLOY_SSH_KEY_ATLAS_WORKER_PRODUCTION }}
     with:
       app: atlas-worker                    # KIND=worker, OVERLAP=false if it schedules jobs
       image: ghcr.io/arslan-khan-dev/atlas-worker

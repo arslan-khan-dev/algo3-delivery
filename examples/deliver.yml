@@ -22,8 +22,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-      deployments: read
-    secrets: inherit
+    secrets: inherit                 # DEPLOY_SSH_KEY_STAGING / _PRODUCTION repository secrets
     with:
       app: nexwe-website
       staging-url: https://staging.nexwe.app
