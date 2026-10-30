@@ -13,6 +13,9 @@ RUN test -n "$RELEASE_SHA" && mkdir -p /out && cp -r "/app/$OUTPUT_DIR/." /out/ 
     && printf '{"release":"%s"}\n' "$RELEASE_SHA" > /out/release.json
 
 FROM caddy:2.11.7-alpine
+# Security fixes published after the base image was built: CI's scan refuses
+# fixable CRITICAL vulnerabilities, and base images lag behind the fixes.
+RUN apk upgrade --no-cache
 # Serves /srv, falls back to index.html for client-side routes.
 RUN printf ':80 {\n\troot * /srv\n\tencode zstd gzip\n\ttry_files {path} /index.html\n\tfile_server\n}\n' > /etc/caddy/Caddyfile
 COPY --from=build /out /srv

@@ -4,6 +4,9 @@
 # Registry: CONTAINER_PORT=8000 HEALTH_PATH=/healthz RELEASE_PATH=/healthz RELEASE_KEY=version
 # Migrations: RELEASE_COMMAND=alembic upgrade head   (Django: python manage.py migrate --noinput)
 FROM python:3.12.16-slim
+# Security fixes published after the base image was built: CI's scan refuses
+# fixable CRITICAL vulnerabilities, and base images lag behind the fixes.
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PORT=8000
 WORKDIR /app
 COPY requirements.txt ./

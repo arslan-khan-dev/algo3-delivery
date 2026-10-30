@@ -11,6 +11,9 @@ ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
 FROM node:22.23.4-alpine
+# Security fixes published after the base image was built: CI's scan refuses
+# fixable CRITICAL vulnerabilities, and base images lag behind the fixes.
+RUN apk upgrade --no-cache
 ENV NODE_ENV=production PORT=3000 HOSTNAME=0.0.0.0 NEXT_TELEMETRY_DISABLED=1
 WORKDIR /app
 COPY --from=build --chown=node:node /app/.next/standalone ./

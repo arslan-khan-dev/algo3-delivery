@@ -9,6 +9,9 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/server
 
 FROM alpine:3.24
+# Security fixes published after the base image was built: CI's scan refuses
+# fixable CRITICAL vulnerabilities, and base images lag behind the fixes.
+RUN apk upgrade --no-cache
 RUN adduser -D -u 10001 app
 COPY --from=build /out/app /usr/local/bin/app
 ARG RELEASE_SHA
