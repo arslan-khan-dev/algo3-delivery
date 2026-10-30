@@ -274,7 +274,11 @@ jobs:
 
   deploy-staging:
     needs: [plan, build]
-    if: needs.plan.outputs.target == 'staging'
+    # always(): without it, GitHub skips this job whenever ANY earlier job in
+    # the chain was skipped, e.g. validate when no tests are configured, even
+    # though build succeeded. That silently skipped the first real staging
+    # deploy (2026-10-30). The explicit result check keeps it safe.
+    if: always() && needs.plan.outputs.target == 'staging' && needs.build.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
@@ -387,7 +391,7 @@ jobs:
 
   deploy-production:
     needs: [plan, promote]
-    if: needs.plan.outputs.target == 'production'
+    if: always() && needs.plan.outputs.target == 'production' && needs.promote.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions: {}
@@ -412,3 +416,26 @@ jobs:
           RELEASE_KEY: ${{ inputs.release-key }}
           SHA: ${{ needs.promote.outputs.sha }}
         run: *verify
+
+  # A run must never look green when nothing was deployed: skipped jobs count
+  # as "not failed", so without this a silently skipped deploy shows a tick.
+  result:
+    needs: [plan, deploy-staging, deploy-production]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: The deploy this push asked for actually happened
+        env:
+          TARGET: ${{ needs.plan.outputs.target }}
+          STAGING: ${{ needs.deploy-staging.result }}
+          PRODUCTION: ${{ needs.deploy-production.result }}
+        run: |
+          case "$TARGET" in
+            staging)    got="$STAGING" ;;
+            production) got="$PRODUCTION" ;;
+            *)          echo "::error::no deploy target (plan failed)"; exit 1 ;;
+          esac
+          [[ "$got" == success ]] || { echo "::error::deploy-$TARGET ended '$got', not 'success': nothing was deployed"; exit 1; }
+          echo "deploy-$TARGET succeeded"
