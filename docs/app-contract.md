@@ -150,6 +150,7 @@ it from the server, so the generated site takes over again.
 | `CONTAINER_PORT` | `80` | port the app listens on inside the container |
 | `HEALTH_PATH` | `/` | HTTP readiness path; empty means rely on the Docker HEALTHCHECK |
 | `RELEASE_PATH` / `RELEASE_KEY` | `/release.json` / `release` (web) | release marker; empty means identity by image digest only |
+| `PUBLIC_PATH` | `/` | the path the public check requests after a switch; it must answer 2xx. **An API with no page at `/` must set this** (e.g. `/health`), or every deploy is refused and rolled back |
 | `RELEASE_COMMAND` | (none) | migrations etc.; one line, no shell (use `sh -c '…'` for shell features) |
 | `RELEASE_TIMEOUT` | `300` | seconds before the release command is killed and the deploy refused |
 | `VOLUMES` | (none) | `<app>-name:/path[:ro]`, comma-separated |
@@ -170,5 +171,6 @@ it from the server, so the generated site takes over again.
       `restrict,command="/usr/local/sbin/algo3-deploy-ssh <app> <env>" ssh-ed25519 … ci-<app>-<env>`.
 - [ ] Repository secrets `DEPLOY_SSH_KEY_STAGING` and `DEPLOY_SSH_KEY_PRODUCTION`, and variables `VPS_HOST` and `VPS_KNOWN_HOSTS` (GitHub Free has no environments in private repos). A repo with several apps uses one pair of secrets per app and maps them in its workflow (see `examples/deliver-multi-service.yml`).
 - [ ] `.github/workflows/deliver.yml`: copy `examples/deliver.yml`, or `examples/deliver-multi-service.yml` for a repo with several services. Set `validate-image` and `validate-command` for your language's tests.
+- [ ] A repo that holds the app **and unrelated code** (e.g. nexwe: a mobile app next to `server/`): set `tree-path: server` (needs `@v1.1`) and add `paths: ['server/**']` to the caller's `push` trigger. Promotion then compares only that folder, so a mobile-only change neither deploys the server nor blocks its promotion. Not for repos whose apps share code outside their folder (Atlas's `packages/`).
 - [ ] UptimeRobot monitor for each primary domain. Certificate expiry for **every** domain is watched by Netdata automatically, from the registry.
 - [ ] First staging deploy watched, then the first production promotion.

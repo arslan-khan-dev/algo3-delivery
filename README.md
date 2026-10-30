@@ -38,8 +38,10 @@ server: ssh (key pinned to one app/env) ─► algo3-deploy-ssh ─► sudo algo
 | `server/bin/algo3-cert-watch` | Keeps Netdata's certificate checks equal to every registered domain |
 | `server/test/run.sh` | The test suite. It fakes docker and curl and covers every failure path |
 | `edge/` | `algo3-edge`, the single Caddy container on 80/443, its installer, and `CUTOVER.md` |
+| `turn/` | `algo3-turn`, coturn for nexwe's calls (host network, relays to the public internet only), with its config template |
+| `server/apps/biruno/`, `server/apps/nexwe/` | biruno (custom SSE template) and the nexwe API (`OVERLAP=false`), each staging + production |
 | `docs/rollout-nexwe-website.md` | Phase 4: GitHub settings, deploy keys, the first automatic deploys |
-| `lab/` | A local stand-in for the VPS. Every server step is rehearsed there first. **Start with `lab/GUIDE.md`**: the step-by-step guide, from the first test to the server |
+| `lab/` | A local stand-in for the VPS. Every server step is rehearsed there first. **Start with `lab/GUIDE.md`**: the step-by-step guide, from the first test to the server. `rehearse-platform.sh` (studio-platform's core) and `rehearse-products.sh` (biruno + nexwe on it) follow Phase 3 |
 | `server/baseline/baseline.sh` | Server baseline, one component at a time: `sysctl`, `apt`, `docker`, `timers`, `ops`, `ssh` |
 | `server/baseline/ops/` | autoheal (restarts unhealthy containers) + Netdata (alerts by email, through healthchecks.io), pinned by digest |
 | `server/baseline/bin/` | Heartbeat to healthchecks.io (every 5 min), pending-reboot alert (daily), image prune (weekly; never containers) |

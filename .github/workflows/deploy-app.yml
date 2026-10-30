@@ -95,6 +95,14 @@ on:
       production-url:
         type: string
         default: ""
+      tree-path:
+        description: >-
+          Monorepos: the folder this app is built from (e.g. "server"). Promotion
+          then compares only that folder's code with staging's, so a change
+          elsewhere in the repo (a mobile app) does not block it. Empty compares
+          the whole repo. Pair it with a `paths:` filter in the caller.
+        type: string
+        default: ""
     secrets:
       # A one-app repo passes these with `secrets: inherit`. A repo with several
       # apps maps a different key onto them for each app (keys are pinned to one
@@ -363,7 +371,7 @@ jobs:
       # Compare git TREES, not commit SHAs: a merge commit or a fast-forward of
       # staging into main both qualify, as long as the code is identical. The
       # candidate must also carry :staging-ok-<sha>, which only a successful
-      # staging deploy adds.
+      # staging deploy adds. With tree-path, only that folder's tree counts.
       - name: Find the staging deploy of this exact code
         id: find
         env:
@@ -371,12 +379,24 @@ jobs:
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
           IMAGE: ${{ needs.plan.outputs.image }}
+          TREE_PATH: ${{ inputs.tree-path }}
         run: |
-          tree="$(gh api "repos/$REPO/git/commits/$SHA" --jq .tree.sha)"
-          echo "main $SHA has tree $tree"
+          [[ -z "$TREE_PATH" || "$TREE_PATH" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] || { echo "::error::invalid tree-path"; exit 1; }
+          # The tree to compare for a commit: its root tree, or the tree of
+          # TREE_PATH inside it (empty when the folder does not exist there).
+          code_of() {   # code_of <commit-sha> <root-tree-sha>
+            if [[ -z "$TREE_PATH" ]]; then echo "$2"; return; fi
+            gh api "repos/$REPO/git/trees/$2?recursive=1" \
+              --jq ".tree[] | select(.path == \"$TREE_PATH\" and .type == \"tree\") | .sha"
+          }
+          root="$(gh api "repos/$REPO/git/commits/$SHA" --jq .tree.sha)"
+          tree="$(code_of "$SHA" "$root")"
+          [[ -n "$tree" ]] || { echo "::error::$TREE_PATH not found in $SHA"; exit 1; }
+          echo "main $SHA has ${TREE_PATH:-repo} tree $tree"
           found=""
-          while read -r candidate candidate_tree; do
-            [[ "$candidate_tree" == "$tree" ]] || continue
+          while read -r candidate candidate_root; do
+            candidate_tree="$(code_of "$candidate" "$candidate_root")"
+            [[ -n "$candidate_tree" && "$candidate_tree" == "$tree" ]] || continue
             if docker buildx imagetools inspect "$IMAGE:staging-ok-$candidate" >/dev/null 2>&1; then
               found="$candidate"; break
             fi

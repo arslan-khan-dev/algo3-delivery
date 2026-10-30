@@ -1,0 +1,48 @@
+# coturn for nexwe — copy to /opt/algo3/turn/turnserver.conf (folder root-only,
+# 0700) and replace REPLACE_WITH_TURN_SECRET. Generate the secret with:
+#   openssl rand -hex 32
+# The same value goes into TURN_SECRET in BOTH nexwe env files
+# (/etc/algo3/apps/nexwe/staging.env and production.env), with
+#   TURN_URLS=turn:turn.nexwe.app:3478,turn:turn.nexwe.app:3478?transport=tcp
+
+listening-port=3478
+realm=turn.nexwe.app
+server-name=turn.nexwe.app
+
+# Listen and relay on the server's PUBLIC address only. Without these, coturn
+# uses every address it finds, including loopback and Docker's bridges.
+listening-ip=179.236.229.2
+relay-ip=179.236.229.2
+
+# Time-limited credentials signed by the API (src/turn.ts): coturn checks the
+# same HMAC, so no user list lives here and a leaked credential expires.
+use-auth-secret
+static-auth-secret=REPLACE_WITH_TURN_SECRET
+
+# A small relay range (ufw opens exactly this). ~120 concurrent calls.
+min-port=49160
+max-port=49400
+
+# ── Never a door into this server's private networks ─────────────────────
+# A TURN server relays to any address a client names. Without these lines a
+# client could relay into Docker's `studio` network (Postgres, SeaweedFS,
+# GoTrue) or the host's loopback. Public internet only.
+no-multicast-peers
+denied-peer-ip=0.0.0.0-0.255.255.255
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=100.64.0.0-100.127.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=::1
+denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+
+# No TLS listener yet (turns: on 5349 would need the edge's certificate).
+no-tls
+no-dtls
+no-cli
+fingerprint
+log-file=stdout
+simple-log

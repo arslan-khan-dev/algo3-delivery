@@ -265,6 +265,11 @@ check_domain_ownership() {
             done
         done < <(site_addresses "$f")
     done
+    # Without this the function returns the status of its LAST command: the
+    # final `[[ … ]] && die` above is false when nothing clashes, so a clean
+    # check returned failure and `set -e` stopped the deploy silently. Hidden
+    # until the platform had sites to loop over (lab, 2026-10-30).
+    return 0
 }
 
 DNS_PROBLEMS=()

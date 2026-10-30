@@ -509,6 +509,17 @@ register demo-web staging IMAGE=reg.example/demo-web HOSTNAME=demo.example ALIAS
 ok no dep demo-web staging "$A"
 ok has "$STUB_DIR/out" "api.studio.example is already served by the platform"
 
+reset "with platform sites present, an app whose domains do NOT clash deploys"
+# The case the lab found: a clean ownership check ended on a false `[[ ]] && die`
+# and returned failure, so set -e stopped every deploy once the platform had sites.
+mkdir -p /etc/algo3/caddy/platform
+printf 'files.studio.example {\n\treverse_proxy seaweedfs:8333\n}\n\nmail.studio.example {\n\trespond 404\n}\n' > /etc/algo3/caddy/platform/studio-platform.caddy
+register demo-web staging IMAGE=reg.example/demo-web HOSTNAME=demo.example ALIASES=demo.example.org RELEASE_PATH=
+ok dep demo-web staging "$A"
+ok eq "$(routed demo.example)" "demo-web-staging-${A:0:12}"
+ok deploy staging "$B"
+ok eq "$(routed staging.nexwe.app)" "$S-${B:0:12}"
+
 reset "another app's mistake never blocks a rollback"
 register demo-web staging IMAGE=reg.example/demo-web HOSTNAME=demo.example RELEASE_PATH=
 dep demo-web staging "$A"; dep demo-web staging "$B"
