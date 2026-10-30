@@ -326,7 +326,9 @@ jobs:
             echo "- Release: \`$SHA\`"
           } >> "$GITHUB_STEP_SUMMARY"
       # Reached only when the deploy (and the check from the internet) passed:
-      # this label is what production promotion looks for.
+      # this label is what production promotion looks for. It is a yes/no mark
+      # only: `imagetools create` writes a wrapper index with its OWN digest, so
+      # the label's digest is NOT the image's (see promote).
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
@@ -372,12 +374,11 @@ jobs:
         run: |
           tree="$(gh api "repos/$REPO/git/commits/$SHA" --jq .tree.sha)"
           echo "main $SHA has tree $tree"
-          found=""; digest=""
+          found=""
           while read -r candidate candidate_tree; do
             [[ "$candidate_tree" == "$tree" ]] || continue
-            if d="$(docker buildx imagetools inspect "$IMAGE:staging-ok-$candidate" --format '{{json .Manifest}}' 2>/dev/null | jq -r .digest)" &&
-               [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              found="$candidate"; digest="$d"; break
+            if docker buildx imagetools inspect "$IMAGE:staging-ok-$candidate" >/dev/null 2>&1; then
+              found="$candidate"; break
             fi
             echo "staging commit $candidate has this code but was never verified on staging"
           done < <(gh api "repos/$REPO/commits?sha=staging&per_page=50" --jq '.[] | "\(.sha) \(.commit.tree.sha)"')
@@ -385,6 +386,11 @@ jobs:
             echo "::error::This code was never deployed successfully to staging. Merge it to staging first; production only promotes tested releases."
             exit 1
           fi
+          # The digest staging deployed is the one build pushed as :<sha>. Never
+          # take it from the staging-ok label: that is a wrapper index with a
+          # different digest, and the server (rightly) refuses it (2026-10-30).
+          digest="$(docker buildx imagetools inspect "$IMAGE:$found" --format '{{json .Manifest}}' | jq -r .digest)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image digest for $IMAGE:$found"; exit 1; }
           echo "Promoting staging release $found ($digest)"
           echo "sha=$found" >> "$GITHUB_OUTPUT"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
