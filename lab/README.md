@@ -55,6 +55,7 @@ second, and a probe that records nothing fails every check.
 | Phase 4: three refused deploys (bad marker, unhealthy, missing image) | **0** | 0 |
 | Apps: Node API (web) deploy with a migration, then rollback | **0** | 0 |
 | Apps: a failing migration (refused, R2 keeps serving) | **0** | 0 |
+| biruno production, 6 switches on the platform (363 requests) | **1** | 0.6 s (Docker DNS lookup timed out as the alias moved) |
 
 What these numbers changed:
 
