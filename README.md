@@ -8,7 +8,7 @@ push staging ─► validate ─► build :<sha> (digest) ─► smoke test + sc
 merge → main ─► promote: find the staging deploy with the same git tree
              ─► deploy production with staging's exact digest (never rebuilt)
 
-server: ssh (key pinned to one app/env) ─► algo3-deploy-ssh ─► sudo algo3-deploy-wrapper
+server: ssh (key pinned to one env: one app, or --any-app) ─► algo3-deploy-ssh ─► sudo algo3-deploy-wrapper
         ─► systemd unit (survives SSH loss) ─► algo3-deploy:
            pull by digest → start <app>-<env>-<sha12> → health + release marker via the edge
            → give it the stable alias <app>-<env> → stop the old release gracefully

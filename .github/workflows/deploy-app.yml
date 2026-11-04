@@ -16,8 +16,8 @@
 # Settings: repository secrets and variables in the product repo. GitHub Free
 # offers no environments (nor their secrets) in private repositories, so the
 # key names carry the environment instead:
-#   secret   DEPLOY_SSH_KEY_STAGING     private key pinned on the server to <app>/staging
-#   secret   DEPLOY_SSH_KEY_PRODUCTION  private key pinned on the server to <app>/production
+#   secret   DEPLOY_SSH_KEY_STAGING     private key pinned on the server to staging (this app, or --any-app)
+#   secret   DEPLOY_SSH_KEY_PRODUCTION  private key pinned on the server to production (this app, or --any-app)
 #   variable VPS_HOST                   server address
 #   variable VPS_KNOWN_HOSTS            the server's host key line (host-key
 #                                       checking is never disabled)
@@ -299,6 +299,7 @@ jobs:
         env:
           KEY: ${{ secrets.DEPLOY_SSH_KEY_STAGING }}
           KEY_NAME: DEPLOY_SSH_KEY_STAGING
+          APP: ${{ inputs.app }}
           HOST: ${{ vars.VPS_HOST }}
           KNOWN_HOSTS: ${{ vars.VPS_KNOWN_HOSTS }}
           SHA: ${{ github.sha }}
@@ -308,7 +309,10 @@ jobs:
           install -d -m 700 ~/.ssh
           printf '%s\n' "$KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
-          printf '%s\n%s\n' "$SHA" "$DIGEST" |
+          # app= first: a key shared by every app (--any-app on the server) needs
+          # it, and an app-pinned key checks that it matches. The environment is
+          # the key's, never this request's.
+          printf 'app=%s\n%s\n%s\n' "$APP" "$SHA" "$DIGEST" |
             ssh -T -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes \
                 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts \
                 -o ServerAliveInterval=15 -o ConnectTimeout=20 \
@@ -429,6 +433,7 @@ jobs:
         env:
           KEY: ${{ secrets.DEPLOY_SSH_KEY_PRODUCTION }}
           KEY_NAME: DEPLOY_SSH_KEY_PRODUCTION
+          APP: ${{ inputs.app }}
           HOST: ${{ vars.VPS_HOST }}
           KNOWN_HOSTS: ${{ vars.VPS_KNOWN_HOSTS }}
           SHA: ${{ needs.promote.outputs.sha }}

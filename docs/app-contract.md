@@ -167,8 +167,15 @@ it from the server, so the generated site takes over again.
 - [ ] Registry files in this repo under `server/apps/<app>/`: `staging.conf` (with `NOINDEX=true`) and `production.conf` (with `PROMOTE_FROM=staging`), declaring the domains. No Caddy template unless the app needs custom routing (see Domains).
 - [ ] DNS for every domain points at the server, **before** the first deploy (see Domains). `sudo algo3-deploy status <app> <env>` reports it.
 - [ ] On the server: `sudo ./install.sh --app <app>`, plus `<env>.env` (root, 0600) for runtime secrets.
-- [ ] One SSH key per app and environment, added to `~algo3-deploy/.ssh/authorized_keys` as
+- [ ] Deploy keys. The default (since 2026-11-04) is **one key per environment, shared by every app**, already in
+      `~algo3-deploy/.ssh/authorized_keys` as `restrict,command="/usr/local/sbin/algo3-deploy-ssh --any-app staging" …`
+      and `… --any-app production …`: a new app only gets those two secrets in its repo. The environment always
+      comes from the key, so the staging key never deploys production; the shared production key deploys only an
+      environment with `PROMOTE_FROM`, so it can only move a release staging verified with the same digest. The
+      cost: anyone who can read one product's secrets can deploy every product's staging, and promote any of
+      them. For an app that needs its own, pin a key to it instead:
       `restrict,command="/usr/local/sbin/algo3-deploy-ssh <app> <env>" ssh-ed25519 … ci-<app>-<env>`.
+      Workflow `v1.1`+ sends `app=<name>` first; an app-pinned key checks it matches.
 - [ ] Repository secrets `DEPLOY_SSH_KEY_STAGING` and `DEPLOY_SSH_KEY_PRODUCTION`, and variables `VPS_HOST` and `VPS_KNOWN_HOSTS` (GitHub Free has no environments in private repos). A repo with several apps uses one pair of secrets per app and maps them in its workflow (see `examples/deliver-multi-service.yml`).
 - [ ] `.github/workflows/deliver.yml`: copy `examples/deliver.yml`, or `examples/deliver-multi-service.yml` for a repo with several services. Set `validate-image` and `validate-command` for your language's tests.
 - [ ] A repo that holds the app **and unrelated code** (e.g. nexwe: a mobile app next to `server/`): set `tree-path: server` (needs `@v1.1`) and add `paths: ['server/**']` to the caller's `push` trigger. Promotion then compares only that folder, so a mobile-only change neither deploys the server nor blocks its promotion. Not for repos whose apps share code outside their folder (Atlas's `packages/`).

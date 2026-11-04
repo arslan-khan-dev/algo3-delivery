@@ -287,6 +287,35 @@ ok no bash -c "printf '%s\n' 'rm -rf /' | $SSH $APP staging" >/dev/null 2>&1
 ok bash -c "SSH_ORIGINAL_COMMAND='bash -i' printf '%s\n' $B | $SSH $APP staging" >/dev/null 2>&1
 ok eq "$(routed staging.nexwe.app)" "$S-${B:0:12}"
 
+reset "SSH shim: app= from the workflow, and keys shared by every app"
+export STUB_WRAPPER="$W"
+# An app-pinned key accepts app= only when it names that app.
+ok bash -c "printf '%s\n' app=$APP $A | $SSH $APP staging" >/dev/null 2>&1
+ok eq "$(routed staging.nexwe.app)" "$S-${A:0:12}"
+ok no bash -c "printf '%s\n' app=other-app $B | $SSH $APP staging" >/dev/null 2>&1
+ok eq "$(routed staging.nexwe.app)" "$S-${A:0:12}"
+# A key for every app needs app=, and only reaches registered apps.
+ok no bash -c "printf '%s\n' $B | $SSH --any-app staging" >/dev/null 2>&1
+ok no bash -c "printf '%s\n' app=unknown-app $B | $SSH --any-app staging" >/dev/null 2>&1
+ok no bash -c "printf '%s\n' app=../etc $B | $SSH --any-app staging" >/dev/null 2>&1
+ok eq "$(routed staging.nexwe.app)" "$S-${A:0:12}"
+ok bash -c "printf '%s\n' app=$APP $B | $SSH --any-app staging" >/dev/null 2>&1
+ok eq "$(routed staging.nexwe.app)" "$S-${B:0:12}"
+# The environment is the key's: the staging key never touched production.
+ok eq "$(n_containers production)" 0
+ok no bash -c "printf '%s\n' app=$APP $B | $SSH --any-app ../production" >/dev/null 2>&1
+# The shared production key promotes only what staging verified...
+ok no bash -c "printf '%s\n' app=$APP $C $(digest "$C") | $SSH --any-app production" >/dev/null 2>&1
+ok eq "$(n_containers production)" 0
+ok bash -c "printf '%s\n' app=$APP $B $(digest "$B") | $SSH --any-app production" >/dev/null 2>&1
+ok eq "$(routed nexwe.app)" "$P-${B:0:12}"
+# ...and refuses outright an environment without PROMOTE_FROM.
+mkdir -p /etc/algo3/apps/demo-direct
+printf '%s\n' IMAGE=reg.example/demo-direct HOSTNAME=direct.example HEALTH_ATTEMPTS=3 > /etc/algo3/apps/demo-direct/production.conf
+ok no bash -c "printf '%s\n' app=demo-direct $A $(digest "$A") | $SSH --any-app production" >"$STUB_DIR/out" 2>&1
+ok has "$STUB_DIR/out" "does not set PROMOTE_FROM"
+ok eq "$(n_containers production)" 1
+
 reset "public check uses 443 by default"
 ok deploy staging "$A"
 ok grep -q "^https://staging.nexwe.app:443/" "$STUB_DIR/public-urls"

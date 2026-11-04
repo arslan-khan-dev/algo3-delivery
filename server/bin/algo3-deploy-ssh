@@ -1,28 +1,66 @@
 #!/usr/bin/env bash
 # algo3-deploy-ssh — forced command for CI deploy keys.
 #
-# Each key in ~algo3-deploy/.ssh/authorized_keys is pinned to ONE app and env:
-#   restrict,command="/usr/local/sbin/algo3-deploy-ssh nexwe-website staging" ssh-ed25519 AAAA… ci-nexwe-website-staging
+# Each key in ~algo3-deploy/.ssh/authorized_keys is pinned to ONE environment,
+# and either to one app or to every app registered for that environment:
 #
-# Whatever command the client asks for (SSH_ORIGINAL_COMMAND) is ignored. The
-# only input taken from the client is stdin: the SHA and the image digest. A
-# leaked staging key therefore cannot deploy production, or another app, or
-# run a shell.
+#   restrict,command="/usr/local/sbin/algo3-deploy-ssh nexwe-website staging" ssh-ed25519 AAAA… ci-nexwe-website-staging
+#   restrict,command="/usr/local/sbin/algo3-deploy-ssh --any-app staging"     ssh-ed25519 AAAA… ci-staging
+#   restrict,command="/usr/local/sbin/algo3-deploy-ssh --any-app production"  ssh-ed25519 AAAA… ci-production
+#
+# The environment ALWAYS comes from the key, never from the client: a staging
+# key cannot deploy production, whatever it sends. Whatever command the client
+# asks for (SSH_ORIGINAL_COMMAND) is ignored; the only input is stdin:
+#
+#   app=<name>        optional for an app-pinned key (must then match it),
+#                     required for an --any-app key; sent by workflow v1.1+
+#   <commit sha>      full, 40 characters
+#   <image digest>    sha256:…, optional (required where the env has PROMOTE_FROM)
+#
+# An --any-app key is one secret shared by every product's repository, so it
+# is held to one more rule: outside staging it may only deploy an environment
+# that promotes (PROMOTE_FROM), so a leaked production key can only move a
+# release that staging already verified, with the same image digest.
 set -Eeuo pipefail
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-[[ $# -eq 2 ]] || die "Misconfigured forced command: expected <app> <env>"
-app="$1"
-env="$2"
+readonly APPS="${ALGO3_APPS_DIR:-/etc/algo3/apps}"
 
-IFS= read -r -t 10 sha || die "Missing commit SHA"
+[[ $# -eq 2 ]] || die "Misconfigured forced command: expected <app> <env> or --any-app <env>"
+pinned="$1"
+env="$2"
+[[ "$env" =~ ^[a-z][a-z0-9-]{0,20}$ ]] || die "Misconfigured forced command: invalid environment"
+[[ "$pinned" == --any-app || "$pinned" =~ ^[a-z][a-z0-9-]{1,40}$ ]] || die "Misconfigured forced command: invalid app"
+
+IFS= read -r -t 10 first || die "Missing commit SHA"
+app=""
+if [[ "$first" == app=* ]]; then
+    app="${first#app=}"
+    IFS= read -r -t 10 sha || die "Missing commit SHA"
+else
+    sha="$first"
+fi
 digest=""
 IFS= read -r -t 10 digest || true
 if IFS= read -r -t 2 _; then die "Unexpected additional input"; fi
 
+if [[ "$pinned" == --any-app ]]; then
+    [[ -n "$app" ]] || die "This key serves every app: send app=<name> first"
+else
+    [[ -z "$app" || "$app" == "$pinned" ]] || die "This key is for $pinned, not $app"
+    app="$pinned"
+fi
+[[ "$app" =~ ^[a-z][a-z0-9-]{1,40}$ ]] || die "Invalid app name"
 [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "Expected a full lowercase 40-character commit SHA"
 [[ -z "$digest" || "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "Invalid image digest"
+
+if [[ "$pinned" == --any-app && "$env" != staging ]]; then
+    conf="$APPS/$app/$env.conf"
+    [[ -f "$conf" ]] || die "$app/$env is not registered on this server"
+    grep -qE '^PROMOTE_FROM=[a-z]' "$conf" ||
+        die "$app/$env does not set PROMOTE_FROM: a key shared by every app may only promote a verified release"
+fi
 
 printf '%s\n%s\n%s\n%s\n' "$app" "$env" "$sha" "$digest" |
     exec sudo -n /usr/local/sbin/algo3-deploy-wrapper
