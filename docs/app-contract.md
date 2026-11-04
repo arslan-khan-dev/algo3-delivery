@@ -165,7 +165,7 @@ it from the server, so the generated site takes over again.
 
 - [ ] Rules 1–11 met. Start from the matching template.
 - [ ] Registry files in this repo under `server/apps/<app>/`: `staging.conf` (with `NOINDEX=true`) and `production.conf` (with `PROMOTE_FROM=staging`), declaring the domains. No Caddy template unless the app needs custom routing (see Domains).
-- [ ] DNS for every domain points at the server, **before** the first deploy (see Domains). `sudo algo3-deploy status <app> <env>` reports it.
+- [ ] DNS for every domain points at the server, **before** the first deploy (see Domains). `sudo /usr/local/libexec/algo3-deploy status <app> <env>` reports it.
 - [ ] On the server: `sudo ./install.sh --app <app>`, plus `<env>.env` (root, 0600) for runtime secrets.
 - [ ] Deploy keys. The default (since 2026-11-04) is **one key per environment, shared by every app**, already in
       `~algo3-deploy/.ssh/authorized_keys` as `restrict,command="/usr/local/sbin/algo3-deploy-ssh --any-app staging" …`

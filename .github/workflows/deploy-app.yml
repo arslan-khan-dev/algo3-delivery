@@ -277,6 +277,11 @@ jobs:
           DIGEST: ${{ steps.digest.outputs.digest }}
           SEVERITY: ${{ inputs.scan-severity }}
         run: |
+          # Trivy reads the image from this runner's Docker. The smoke test
+          # pulls it, but with smoke: none nothing has: trivy then falls back to
+          # the registry WITHOUT credentials, and a private package answers
+          # UNAUTHORIZED (biruno, 2026-11-04). Pull it here, signed in.
+          docker image inspect "$IMAGE@$DIGEST" >/dev/null 2>&1 || docker pull --quiet "$IMAGE@$DIGEST"
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.76.1 \
             image --quiet --ignore-unfixed --exit-code 1 --severity "$SEVERITY" "$IMAGE@$DIGEST"
 
