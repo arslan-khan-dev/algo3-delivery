@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Writes nexwe's runtime secrets: /etc/algo3/apps/nexwe/{staging,production}.env
 #
-#   sudo bash /opt/algo3/delivery/server/apps/nexwe/make-env.sh FIREBASE.json PLAY.json
+#   sudo bash /opt/algo3/delivery/server/apps/nexwe/make-env.sh FIREBASE.json [PLAY.json]
 #
 # Run once, after studio-platform's `add-product.sh nexwe …` and `nexwe-staging …`.
 # Everything is generated or read from where it already lives, except the
@@ -11,8 +11,10 @@
 #                           the S3 bucket and keys, the mail account
 #   generated               JWT_SECRET per environment, the TURN secret (shared
 #                           with coturn, kept in /etc/algo3/apps/nexwe/turn-secret)
-#   asked                   Twilio, Google Play's package, RTDN token and product id
-#   files                   the Firebase and Google Play service-account JSON
+#   asked                   Twilio; with PLAY.json, Google Play's package, RTDN token, product id
+#   files                   the Firebase service-account JSON, and Google Play's (optional:
+#                           without it purchases stay off and no Play setting is written;
+#                           add the four GOOGLE_PLAY_*/FUTURELOCK lines later and redeploy)
 #
 # Both environments get the same outside services for now; only the database,
 # bucket, JWT secret and public address differ. It refuses to overwrite an env
@@ -25,9 +27,9 @@ APPS="${NEXWE_APPS_DIR:-/etc/algo3/apps/nexwe}"
 PLATFORM="${NEXWE_PLATFORM_DIR:-/opt/studio-platform}"
 
 [[ $EUID -eq 0 ]] || die "Run with sudo"
-[[ $# -eq 2 ]] || die "usage: make-env.sh FIREBASE_SERVICE_ACCOUNT.json GOOGLE_PLAY_SERVICE_ACCOUNT.json"
-firebase_file="$1"; play_file="$2"
-for f in "$firebase_file" "$play_file"; do [[ -s "$f" ]] || die "$f is missing or empty"; done
+[[ $# -eq 1 || $# -eq 2 ]] || die "usage: make-env.sh FIREBASE_SERVICE_ACCOUNT.json [GOOGLE_PLAY_SERVICE_ACCOUNT.json]"
+firebase_file="$1"; play_file="${2:-}"
+for f in "$firebase_file" ${play_file:+"$play_file"}; do [[ -s "$f" ]] || die "$f is missing or empty"; done
 for e in staging production; do
     [[ -e "$APPS/$e.env" ]] && die "$APPS/$e.env exists: nothing changed (move it aside deliberately to rebuild)"
 done
@@ -38,15 +40,20 @@ done
 oneline() { node -e 'process.stdout.write(JSON.stringify(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))))' "$1" ||
     die "$1 is not valid JSON"; }
 firebase="$(oneline "$firebase_file")"
-play="$(oneline "$play_file")"
+play=""
+[[ -n "$play_file" ]] && play="$(oneline "$play_file")"
 
 read -rp  "Twilio Account SID: " twilio_sid
 read -rsp "Twilio Auth Token (hidden): " twilio_token; echo
 read -rp  "Twilio phone number (+…): " twilio_phone
-read -rp  "Google Play package name: " play_package
-read -rsp "Google Play RTDN token (hidden): " play_rtdn; echo
-read -rp  "FutureLock Plus product id: " futurelock
-for v in twilio_sid twilio_token twilio_phone play_package play_rtdn futurelock; do
+required=(twilio_sid twilio_token twilio_phone)
+if [[ -n "$play" ]]; then
+    read -rp  "Google Play package name: " play_package
+    read -rsp "Google Play RTDN token (hidden): " play_rtdn; echo
+    read -rp  "FutureLock Plus product id: " futurelock
+    required+=(play_package play_rtdn futurelock)
+fi
+for v in "${required[@]}"; do
     [[ -n "${!v}" ]] || die "$v is empty"
 done
 
@@ -90,11 +97,15 @@ TWILIO_ACCOUNT_SID=$twilio_sid
 TWILIO_AUTH_TOKEN=$twilio_token
 TWILIO_PHONE_NUMBER=$twilio_phone
 FIREBASE_SERVICE_ACCOUNT=$firebase
+EOF
+    if [[ -n "$play" ]]; then
+        cat >> "$APPS/$e.env" <<EOF
 GOOGLE_PLAY_PACKAGE_NAME=$play_package
 GOOGLE_PLAY_SERVICE_ACCOUNT=$play
 GOOGLE_PLAY_RTDN_TOKEN=$play_rtdn
 FUTURELOCK_PLUS_PRODUCT_ID=$futurelock
 EOF
+    fi
     chmod 600 "$APPS/$e.env"
     echo "✓ $APPS/$e.env ($(grep -c = "$APPS/$e.env") settings)"
 done
