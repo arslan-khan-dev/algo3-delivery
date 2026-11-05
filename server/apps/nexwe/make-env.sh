@@ -11,7 +11,8 @@
 #                           the S3 bucket and keys, the mail account
 #   generated               JWT_SECRET per environment, the TURN secret (shared
 #                           with coturn, kept in /etc/algo3/apps/nexwe/turn-secret)
-#   asked                   Twilio; with PLAY.json, Google Play's package, RTDN token, product id
+#   asked                   Twilio Verify (account, token, and the service, set to 6-digit codes);
+#                           with PLAY.json, Google Play's package, RTDN token, product id
 #   files                   the Firebase service-account JSON, and Google Play's (optional:
 #                           without it purchases stay off and no Play setting is written;
 #                           add the four GOOGLE_PLAY_*/FUTURELOCK lines later and redeploy)
@@ -43,10 +44,10 @@ firebase="$(oneline "$firebase_file")"
 play=""
 [[ -n "$play_file" ]] && play="$(oneline "$play_file")"
 
-read -rp  "Twilio Account SID: " twilio_sid
+read -rp  "Twilio Account SID (AC…): " twilio_sid
 read -rsp "Twilio Auth Token (hidden): " twilio_token; echo
-read -rp  "Twilio phone number (+…): " twilio_phone
-required=(twilio_sid twilio_token twilio_phone)
+read -rp  "Twilio Verify service SID, 6-digit codes (VA…): " verify_service
+required=(twilio_sid twilio_token verify_service)
 if [[ -n "$play" ]]; then
     read -rp  "Google Play package name: " play_package
     read -rsp "Google Play RTDN token (hidden): " play_rtdn; echo
@@ -95,7 +96,7 @@ TURN_URLS=turn:turn.nexwe.app:3478,turn:turn.nexwe.app:3478?transport=tcp
 TURN_SECRET=$turn_secret
 TWILIO_ACCOUNT_SID=$twilio_sid
 TWILIO_AUTH_TOKEN=$twilio_token
-TWILIO_PHONE_NUMBER=$twilio_phone
+TWILIO_VERIFY_SERVICE_SID=$verify_service
 FIREBASE_SERVICE_ACCOUNT=$firebase
 EOF
     if [[ -n "$play" ]]; then
