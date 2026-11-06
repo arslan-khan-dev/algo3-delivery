@@ -132,7 +132,6 @@ S3_BUCKET=$(v $p STORAGE_BUCKET)
 S3_ACCESS_KEY_ID=$(v $p STORAGE_ACCESS_KEY)
 S3_SECRET_ACCESS_KEY=$(v $p STORAGE_SECRET_KEY)
 S3_FORCE_PATH_STYLE=true
-TRANSLATE_URL=
 EOF"
     done
     check "env files root-only (0600)" '[ "$(stat -c %a /etc/algo3/apps/biruno/staging.env /etc/algo3/apps/nexwe/production.env | sort -u)" = 600 ]'
