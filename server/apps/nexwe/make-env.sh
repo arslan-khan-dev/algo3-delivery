@@ -12,6 +12,7 @@
 #   generated               JWT_SECRET per environment, the TURN secret (shared
 #                           with coturn, kept in /etc/algo3/apps/nexwe/turn-secret)
 #   asked                   Twilio Verify (account, token, and the service, set to 6-digit codes);
+#                           the address that receives reports (REPORTS_EMAIL);
 #                           with PLAY.json, Google Play's package, RTDN token, product id
 #   files                   the Firebase service-account JSON, and Google Play's (optional:
 #                           without it purchases stay off and no Play setting is written;
@@ -47,7 +48,8 @@ play=""
 read -rp  "Twilio Account SID (AC…): " twilio_sid
 read -rsp "Twilio Auth Token (hidden): " twilio_token; echo
 read -rp  "Twilio Verify service SID, 6-digit codes (VA…): " verify_service
-required=(twilio_sid twilio_token verify_service)
+read -rp  "Email address that receives reports (Report button): " reports_email
+required=(twilio_sid twilio_token verify_service reports_email)
 if [[ -n "$play" ]]; then
     read -rp  "Google Play package name: " play_package
     read -rsp "Google Play RTDN token (hidden): " play_rtdn; echo
@@ -92,6 +94,7 @@ SMTP_PORT=465
 SMTP_USER=$smtp_user
 SMTP_PASSWORD=$smtp_pass
 SMTP_FROM=$smtp_user
+REPORTS_EMAIL=$reports_email
 TURN_URLS=turn:turn.nexwe.app:3478,turn:turn.nexwe.app:3478?transport=tcp
 TURN_SECRET=$turn_secret
 TWILIO_ACCOUNT_SID=$twilio_sid
