@@ -163,7 +163,10 @@ step4() {
 
 step5() {
     title "Step 5 · the staging apps move to studio-staging"
-    run "sudo sed -i 's#^STORAGE_PUBLIC_ENDPOINT=.*#STORAGE_PUBLIC_ENDPOINT=https://files-staging.$D#' /etc/algo3/apps/nexwe/staging.env /etc/algo3/apps/biruno/staging.env"
+    # nexwe reaches storage by the PUBLIC address on the server (S3_ENDPOINT=
+    # https://files.<domain>; the lab's uses the internal name, so this is a
+    # no-op here). biruno uses http://seaweedfs:8333: the network change is enough.
+    run "sudo sed -i 's#^S3_ENDPOINT=https://files\\.$D\$#S3_ENDPOINT=https://files-staging.$D#' /etc/algo3/apps/nexwe/staging.env"
     note "(on the server: sudo bash /opt/algo3/delivery/server/install.sh --app nexwe, then --app biruno."
     note " The lab writes the same files with its registry and domain names, as rehearse-products.sh does.)"
     as_root "for e in staging production; do
@@ -252,6 +255,37 @@ step7() {
     check "files.$D and files-staging.$D both 403" "[ \"\$(curl -s -o /dev/null -w '%{http_code}' https://files.$D/x/y)\" = 403 ] && [ \"\$(curl -s -o /dev/null -w '%{http_code}' https://files-staging.$D/x/y)\" = 403 ]"
 }
 
-[[ $# -gt 0 ]] || set -- 0 1 2 3 4 5 6 7
+step8() {
+    title "Step 8 · drop the old staging copies from production's platform (move-product.sh --drop-source)"
+    note "(the platform's new move-product.sh, as CI would bring it)"
+    as_root "install -m 0755 /lab/studio-platform/scripts/move-product.sh $P/scripts/move-product.sh"
+    local all_b staging_b
+    read -r all_b staging_b < <(as_root "echo \$(grep -c '^BIRUNO_[A-Z0-9_]*=' $P/.env) \$(grep -c '^BIRUNO_STAGING_' $P/.env)")
+    check "refused for a product that was never moved (demo-staging)" "cd $P && ! scripts/move-product.sh demo-staging $S --drop-source 2>/tmp/out.d && grep -q 'move it first' /tmp/out.d && docker exec studio-postgres psql -U postgres -Atc \"select 1 from pg_database where datname='demo_staging'\" | grep -qx 1"
+    as_root "docker run -d --rm --name lab-holder --network studio postgres:17-alpine sleep 600 >/dev/null; docker exec -d lab-holder sh -c \"PGPASSWORD=\$(grep -E '^POSTGRES_PASSWORD=' $P/.env | tail -1 | cut -d= -f2-) psql -h postgres -U postgres -d nexwe_staging -c 'select pg_sleep(60)'\"
+             for _ in \$(seq 1 30); do [ \"\$(docker exec studio-postgres psql -U postgres -Atc \"select count(*) from pg_stat_activity where datname='nexwe_staging'\")\" -ge 1 ] && break; sleep 1; done"
+    check "refused while something is connected to the old database" "cd $P && ! scripts/move-product.sh nexwe-staging $S --drop-source 2>/tmp/out.c && grep -q 'connection' /tmp/out.c"
+    # The server side of that query outlives its client: end it, as an app's stop would.
+    as_root "docker rm -f lab-holder >/dev/null; docker exec studio-postgres psql -U postgres -Atqc \"select pg_terminate_backend(pid) from pg_stat_activity where datname='nexwe_staging'\" >/dev/null"
+    run "cd $P && sudo scripts/move-product.sh nexwe-staging $S --drop-source 2>&1 | tail -6"
+    run "cd $P && sudo scripts/move-product.sh biruno-staging $S --drop-source 2>&1 | tail -6"
+    local d
+    for d in nexwe_staging biruno_staging auth_biruno_staging; do
+        check "$d gone from production, still on staging" "! docker exec studio-postgres psql -U postgres -Atc \"select 1 from pg_database where datname='$d'\" | grep -q 1 && docker exec studio-staging-postgres psql -U postgres -Atc \"select 1 from pg_database where datname='$d'\" | grep -qx 1"
+    done
+    check "their roles gone from production" "! docker exec studio-postgres psql -U postgres -Atc \"select rolname from pg_roles where rolname in ('nexwe_staging','biruno_staging','gotrue_biruno_staging')\" | grep -q ."
+    check "biruno's own databases untouched" "docker exec studio-postgres psql -U postgres -Atc \"select count(*) from pg_database where datname in ('biruno','auth_biruno')\" | grep -qx 2"
+    check "buckets gone from production, still on staging" "cd $P && ! docker compose exec -T seaweedfs sh -c 'echo s3.bucket.list | weed shell' 2>/dev/null | grep -qE '(nexwe|biruno)-staging-files' && cd $S && [ \"\$(docker compose exec -T seaweedfs sh -c 'echo s3.bucket.list | weed shell' 2>/dev/null | grep -cE '(nexwe|biruno)-staging-files')\" = 2 ]"
+    check "S3 identities gone from production only" "! grep -qE '\"(nexwe|biruno)-staging\"' $P/scripts/s3-identities.json && grep -q '\"nexwe-staging\"' $S/scripts/s3-identities.json && grep -q '\"biruno\"' $P/scripts/s3-identities.json"
+    check "production .env: staging lines, tokens, issuers gone; biruno's own $((all_b - staging_b)) kept" "! grep -qE '^(BIRUNO|NEXWE)_STAGING_' $P/.env && ! grep -qE '(=|,)(nexwe|biruno)-staging[:|]' $P/.env && [ \"\$(grep -c '^BIRUNO_[A-Z0-9_]*=' $P/.env)\" = $((all_b - staging_b)) ] && grep -qE '(=|,)biruno:' $P/.env"
+    check "mail templates moved out of production into the backup" "! test -e $P/mail-templates/biruno-staging && ls -d /root/biruno-staging-moved-*/mail-templates >/dev/null && test -d $S/mail-templates/biruno-staging"
+    check "backups readable: every dump lists, files saved" "for f in /root/nexwe-staging-moved-*/nexwe_staging.dump /root/biruno-staging-moved-*/biruno_staging.dump /root/biruno-staging-moved-*/auth_biruno_staging.dump; do docker exec -i studio-postgres pg_restore --list < \$f >/dev/null || exit 1; done; [ \"\$(find /root/nexwe-staging-moved-*/files -type f | wc -l)\" -ge 1 ]"
+    check "the photo is still readable on staging" "cd $S && read -r k s < <(node -e 'const i=JSON.parse(require(\"fs\").readFileSync(\"scripts/s3-identities.json\")).identities.find(x=>x.name===\"nexwe-staging\").credentials[0]; console.log(i.accessKey, i.secretKey)'); docker run --rm --network studio-staging curlimages/curl:8.11.1 -fsS --aws-sigv4 aws:amz:us-east-1:s3 --user \"\$k:\$s\" http://seaweedfs:8333/nexwe-staging-files/chat/photo.txt | grep -q 'staging chat'"
+    check "a second run is refused (nothing to drop)" "cd $P && ! scripts/move-product.sh nexwe-staging $S --drop-source 2>/tmp/out.e && grep -q 'already dropped' /tmp/out.e"
+    check "every production platform service is running" "cd $P && [ \"\$(docker compose ps -a --format '{{.Service}} {{.State}}' | grep -vc ' running\$')\" = 0 ]"
+    step7
+}
+
+[[ $# -gt 0 ]] || set -- 0 1 2 3 4 5 6 7 8
 for s in "$@"; do "step$s"; done
 finish

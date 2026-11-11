@@ -8,7 +8,10 @@
 # outside services, which it asks for (hidden) or takes as files:
 #
 #   from studio-platform    database URL (a NEW password, via product-env.sh),
-#                           the S3 bucket and keys, the mail account
+#                           the S3 bucket, keys and public files address, the
+#                           mail account. Staging reads the STAGING platform
+#                           (/opt/studio-platform-staging) once it exists:
+#                           nexwe-staging lives there, at files-staging.<domain>
 #   generated               JWT_SECRET per environment, the TURN secret (shared
 #                           with coturn, kept in /etc/algo3/apps/nexwe/turn-secret)
 #   asked                   Twilio Verify (account, token, and the service, set to 6-digit codes);
@@ -27,6 +30,8 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 APPS="${NEXWE_APPS_DIR:-/etc/algo3/apps/nexwe}"
 PLATFORM="${NEXWE_PLATFORM_DIR:-/opt/studio-platform}"
+STAGING_PLATFORM="${NEXWE_STAGING_PLATFORM_DIR:-/opt/studio-platform-staging}"
+[[ -f "$STAGING_PLATFORM/.env" ]] || STAGING_PLATFORM="$PLATFORM"   # one platform for both
 
 [[ $EUID -eq 0 ]] || die "Run with sudo"
 [[ $# -eq 1 || $# -eq 2 ]] || die "usage: make-env.sh FIREBASE_SERVICE_ACCOUNT.json [GOOGLE_PLAY_SERVICE_ACCOUNT.json]"
@@ -71,18 +76,19 @@ fi
 turn_secret="$(cat "$APPS/turn-secret")"
 
 for e in staging production; do
-    product=nexwe; origin=https://api.nexwe.app
-    [[ $e == staging ]] && product=nexwe-staging && origin=https://staging-api.nexwe.app
-    block="$(bash "$PLATFORM/scripts/product-env.sh" "$product" --rotate-db-password)"
+    product=nexwe; origin=https://api.nexwe.app; platform="$PLATFORM"
+    [[ $e == staging ]] && product=nexwe-staging && origin=https://staging-api.nexwe.app && platform="$STAGING_PLATFORM"
+    block="$(bash "$platform/scripts/product-env.sh" "$product" --rotate-db-password)"
     get() { sed -n "s/^$1=//p" <<<"$block"; }
     [[ "$(get DATABASE_URL)" == postgres://* ]] || die "no database URL for $product"
+    [[ "$(get STORAGE_PUBLIC_ENDPOINT)" == https://* ]] || die "no public files address for $product"
     cat > "$APPS/$e.env" <<EOF
 NODE_ENV=production
 DATABASE_URL=$(get DATABASE_URL)
 JWT_SECRET=$(openssl rand -hex 32)
 PUBLIC_API_URL=$origin
 CORS_ORIGIN=*
-S3_ENDPOINT=https://files.$domain
+S3_ENDPOINT=$(get STORAGE_PUBLIC_ENDPOINT)
 S3_REGION=us-east-1
 S3_BUCKET=$(get STORAGE_BUCKET)
 S3_ACCESS_KEY_ID=$(get STORAGE_ACCESS_KEY)

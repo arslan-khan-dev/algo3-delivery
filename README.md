@@ -67,6 +67,7 @@ merge it to `main`. The `rollback` command is the emergency path.
 docker run --rm -v "$PWD/server:/src:ro" python:3.12-slim \
   bash -c 'apt-get update -qq && apt-get install -y -qq sudo >/dev/null && bash /src/test/run.sh'
 docker run --rm -v "$PWD/server:/src:ro" python:3.12-slim   bash -c 'apt-get update -qq && apt-get install -y -qq sudo rsync >/dev/null && bash /src/test/stack.sh'
-docker run --rm -v "$PWD/server:/mnt:ro" -w /mnt koalaman/shellcheck:v0.11.0 -x   bin/algo3-cert-watch bin/algo3-deploy bin/algo3-deploy-ssh bin/algo3-deploy-stack bin/algo3-deploy-wrapper   install.sh test/run.sh test/stack.sh test/stack-stubs/docker test/stack-stubs/curl
+docker run --rm -v "$PWD/server:/src:ro" node:22-slim bash /src/test/make-env.sh
+docker run --rm -v "$PWD/server:/mnt:ro" -w /mnt koalaman/shellcheck:v0.11.0 -x   bin/algo3-cert-watch bin/algo3-deploy bin/algo3-deploy-ssh bin/algo3-deploy-stack bin/algo3-deploy-wrapper   install.sh test/run.sh test/stack.sh test/make-env.sh test/stack-stubs/docker test/stack-stubs/curl apps/nexwe/make-env.sh
 docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -no-color
 ```
