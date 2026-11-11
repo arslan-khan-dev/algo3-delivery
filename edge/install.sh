@@ -7,7 +7,7 @@
 #   - installs compose.yml and Caddyfile into /opt/algo3/edge (backup on change,
 #     the Caddyfile validated by Caddy itself first);
 #   - creates /opt/algo3/edge/.env from the example ONCE (root, 0600);
-#   - creates the shared `studio` network if missing;
+#   - creates the shared `studio` and `studio-staging` networks if missing;
 #   - copies the host Caddy's certificates + ACME account into the edge's data
 #     volume ONCE (only while the volume holds no certificates), so the edge
 #     already has every certificate when it takes over 80/443: no issuance
@@ -60,13 +60,19 @@ else
     say "created    $dest/.env: set ACME_EMAIL before starting the edge"
 fi
 
-echo "Network"
-if docker network inspect studio >/dev/null 2>&1; then
-    say "exists     studio"
-else
-    docker network create studio >/dev/null
-    say "created    studio"
-fi
+echo "Networks"
+# studio: production's platform and every production app. studio-staging: the
+# staging platform and the staging apps that use it. Separate because apps
+# find the platform by NAME (postgres, seaweedfs, ai): on one network both
+# platforms would answer. The edge joins both.
+for net in studio studio-staging; do
+    if docker network inspect "$net" >/dev/null 2>&1; then
+        say "exists     $net"
+    else
+        docker network create "$net" >/dev/null
+        say "created    $net"
+    fi
+done
 
 echo "Certificates"
 docker volume create algo3-edge-data >/dev/null

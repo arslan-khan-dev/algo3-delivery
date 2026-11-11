@@ -47,9 +47,13 @@ say "ok"
 echo "Programs"
 for f in "$here"/bin/*; do bash -n "$f" || die "Syntax error in $f"; done
 put "$here/bin/algo3-deploy" /usr/local/libexec/algo3-deploy 0755
+put "$here/bin/algo3-deploy-stack" /usr/local/libexec/algo3-deploy-stack 0755
 put "$here/bin/algo3-deploy-wrapper" /usr/local/sbin/algo3-deploy-wrapper 0755
 put "$here/bin/algo3-deploy-ssh" /usr/local/sbin/algo3-deploy-ssh 0755
 put "$here/bin/algo3-cert-watch" /usr/local/sbin/algo3-cert-watch 0755
+# algo3-deploy-stack (KIND=stack) copies releases with rsync; minimal images
+# lack it (the lab did, 2026-11-11). A warning, not a refusal: apps don't need it.
+command -v rsync >/dev/null || say "WARNING: rsync is not installed; KIND=stack deploys need it: sudo apt-get install -y rsync"
 
 echo "sudoers"
 put "$here/etc/sudoers.d/algo3-deploy" /etc/sudoers.d/algo3-deploy 0440 visudo -cf

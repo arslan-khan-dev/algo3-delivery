@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Heartbeat pings only: recorded, never sent.
+printf '%s\n' "${*: -1}" >> "$STUB_DIR/heartbeats"

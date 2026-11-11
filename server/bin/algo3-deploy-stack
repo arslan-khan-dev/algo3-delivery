@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+# algo3-deploy-stack — deploys a docker-compose STACK (KIND=stack), such as
+# studio-platform, the way algo3-deploy deploys an app: from CI, by commit and
+# image digest, promoted from staging, rolled back on failure.
+#
+#   algo3-deploy-stack deploy   <app> <env> <full-sha> [sha256:<digest>]
+#   algo3-deploy-stack rollback <app> <env>
+#   algo3-deploy-stack status   <app> <env>
+#   algo3-deploy-stack adopt    <app> <env> <full-sha> [sha256:<digest>]
+#
+# algo3-deploy hands every KIND=stack app to this program, so CI, the SSH key,
+# the wrapper and the promotion gate are the same as for any app.
+#
+# A stack is not blue/green: it is one directory (STACK_DIR) with a compose
+# project in it, holding state no release may touch (.env, keys, volumes).
+# A release is a "bundle" image: the repo's tracked files under /bundle, built
+# by CI (FROM scratch). Deploying one:
+#
+#   1. pull the bundle by digest; unpack it to $STATE/<app>/<env>/releases/<sha>
+#   2. DRIFT CHECK: STACK_DIR's copy of every released file must still equal
+#      the release that is live. A file someone edited on the server (e.g. a
+#      product's AI lines from add-product.sh, never committed) stops the
+#      deploy and is listed, instead of being silently overwritten.
+#   3. copy the new files in (never PRESERVE, never .env); delete files the
+#      new release no longer has
+#   4. docker compose config, then up -d --build --wait
+#   5. POST_COMMANDS (idempotent scripts of the stack, e.g. edge-sites.sh)
+#   6. on ANY failure from 3 on: the previous release's files go back, and
+#      `up -d --build --wait` and POST_COMMANDS run again. Volumes are never
+#      touched, so data is never rolled back.
+#
+# The first automatic deploy needs a release to compare against: `adopt`
+# records the commit already on disk (after checking it matches exactly).
+#
+# Settings, /etc/algo3/apps/<app>/<env>.conf (whitelist-parsed, never sourced):
+#   KIND=stack
+#   IMAGE=ghcr.io/owner/bundle      the bundle image, without tag
+#   STACK_DIR=/opt/<dir>            where the stack lives
+#   PRESERVE=a,b/c                  extra per-host files the release never writes
+#   POST_COMMANDS=scripts/x.sh,…    run (bash, in STACK_DIR) after every change
+#   PROMOTE_FROM=staging            production: only releases verified there
+#   WAIT_TIMEOUT=300                seconds for every service to be healthy
+set -Eeuo pipefail
+umask 022
+
+readonly ETC="${ALGO3_ETC:-/etc/algo3}"
+readonly STATE="${ALGO3_STATE:-/var/lib/algo3}"
+readonly LOG_FILE="${ALGO3_LOG:-/var/log/algo3/deploys.log}"
+readonly LOCK_DIR="${ALGO3_LOCK_DIR:-/run/lock/algo3}"
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+log() { printf '[algo3-deploy-stack] %s\n' "$*"; }
+
+declare -A CONF=()
+read_conf() {   # same rules as algo3-deploy: data, not code
+    local file="$1"; shift
+    local allowed=" $* " line key value
+    [[ -f "$file" ]] || die "Missing configuration: $file"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]] || die "Malformed line in $file: $line"
+        key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+        [[ "$allowed" == *" $key "* ]] || die "Unknown setting $key in $file"
+        value="${value%\"}"; value="${value#\"}"
+        CONF[$key]="$value"
+    done < "$file"
+}
+conf() { printf '%s' "${CONF[$1]-${2-}}"; }
+require_match() { [[ "$2" =~ $3 ]] || die "Invalid $1: '$2'"; }
+
+load() {
+    read_conf "$ETC/apps/$APP/$ENV_NAME.conf" KIND IMAGE STACK_DIR PRESERVE POST_COMMANDS PROMOTE_FROM WAIT_TIMEOUT
+    [[ "$(conf KIND)" == stack ]] || die "$APP/$ENV_NAME is not KIND=stack"
+    IMAGE="$(conf IMAGE)"; STACK_DIR="$(conf STACK_DIR)"; PROMOTE_FROM="$(conf PROMOTE_FROM)"
+    WAIT_TIMEOUT="$(conf WAIT_TIMEOUT 300)"
+    require_match IMAGE "$IMAGE" '^[a-z0-9][a-z0-9.-]*(:[0-9]{1,5})?(/[a-z0-9._-]+)+$'
+    # Only under /opt, one level, so a typo can never point this at / or /etc.
+    require_match STACK_DIR "$STACK_DIR" '^/opt/[a-z0-9][a-z0-9._-]*$'
+    require_match WAIT_TIMEOUT "$WAIT_TIMEOUT" '^[0-9]{2,4}$'
+    [[ -z "$PROMOTE_FROM" ]] || require_match PROMOTE_FROM "$PROMOTE_FROM" '^[a-z][a-z0-9-]{0,20}$'
+    local p
+    PRESERVE_LIST=(.env)
+    IFS=',' read -r -a extra <<<"$(conf PRESERVE)"
+    for p in "${extra[@]}"; do
+        [[ -n "$p" ]] || continue
+        require_match PRESERVE "$p" '^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$'
+        PRESERVE_LIST+=("$p")
+    done
+    POST_LIST=()
+    IFS=',' read -r -a extra <<<"$(conf POST_COMMANDS)"
+    for p in "${extra[@]}"; do
+        [[ -n "$p" ]] || continue
+        require_match POST_COMMANDS "$p" '^scripts/[a-z0-9][a-z0-9-]*\.sh$'
+        POST_LIST+=("$p")
+    done
+    HEARTBEAT=""
+    [[ -f "$ETC/delivery.conf" ]] &&
+        HEARTBEAT="$(sed -nE 's/^HEARTBEAT_URL="?([^"]*)"?$/\1/p' "$ETC/delivery.conf" | tail -1)"
+    RELEASES="$STATE/$APP/$ENV_NAME/releases"
+    CURRENT_FILE="$STATE/$APP/$ENV_NAME.current"
+}
+
+# ── Records (the same files algo3-deploy writes) ─────────────────────────────
+record() {   # record <action> <result> <sha> <digest> <detail>
+    mkdir -p "$(dirname "$LOG_FILE")"
+    printf '%s action=%s app=%s env=%s result=%s release=%s digest=%s detail=%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$APP" "$ENV_NAME" "$2" "$3" "${4:--}" "${5:--}" >> "$LOG_FILE"
+}
+history_add() { mkdir -p "$STATE/$APP"; printf '%s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$STATE/$APP/$ENV_NAME.history"; }
+was_live_on() {
+    local file="$STATE/$APP/$1.history"
+    [[ -f "$file" ]] && awk -v s="$2" -v d="$3" '$2 == s && $3 == d { f = 1 } END { exit !f }' "$file"
+}
+heartbeat() {
+    [[ -n "$HEARTBEAT" ]] || return 0
+    local url="$HEARTBEAT"; [[ "$1" == fail ]] && url="$HEARTBEAT/fail"
+    curl --fail --silent --max-time 10 --retry 2 "$url" >/dev/null 2>&1 || true
+}
+current() { [[ -f "$CURRENT_FILE" ]] && cat "$CURRENT_FILE" || true; }   # "<sha> <digest>"
+
+# ── Bundles ──────────────────────────────────────────────────────────────────
+fetch_bundle() {   # fetch_bundle <sha> <digest|""> → sets DIGEST, unpacks into $RELEASES/<sha>
+    local sha="$1" want="$2" repo_digests id dir="$RELEASES/$1" tmp="$RELEASES/$1.tmp"
+    log "Pulling $IMAGE:$sha"
+    docker pull "$IMAGE:$sha" >/dev/null || die "Could not pull $IMAGE:$sha"
+    repo_digests="$(docker image inspect --format '{{json .RepoDigests}}' "$IMAGE:$sha")"
+    if [[ -n "$want" ]]; then
+        [[ "$repo_digests" == *"\"$IMAGE@$want\""* ]] ||
+            die "Tag $IMAGE:$sha does not resolve to $want (the tag moved, or the wrong digest was sent)"
+        DIGEST="$want"
+    else
+        DIGEST="$(grep -oE "$IMAGE@sha256:[0-9a-f]{64}" <<<"$repo_digests" | head -1 | cut -d@ -f2 || true)"
+        [[ -n "$DIGEST" ]] || die "Could not determine the digest of $IMAGE:$sha"
+    fi
+    rm -rf "$tmp"; mkdir -p "$tmp"
+    id="$(docker create "$IMAGE@$DIGEST")" || die "Could not open the bundle $IMAGE@$DIGEST"
+    if ! docker cp "$id:/bundle/." "$tmp/" >/dev/null; then
+        docker rm "$id" >/dev/null 2>&1 || true
+        die "The image has no /bundle: is it a stack bundle?"
+    fi
+    docker rm "$id" >/dev/null 2>&1 || true
+    [[ -f "$tmp/docker-compose.yml" || -f "$tmp/compose.yml" ]] || die "The bundle has no compose file"
+    local p
+    for p in "${PRESERVE_LIST[@]}"; do rm -rf "${tmp:?}/$p"; done   # never shipped, never written
+    rm -rf "$dir"; mv "$tmp" "$dir"
+    chmod -R go-w "$dir"
+}
+
+excludes() { local p; for p in "${PRESERVE_LIST[@]}"; do printf -- '--exclude=/%s\n' "$p"; done; }
+
+drift() {   # drift <release dir>: released files whose STACK_DIR copy differs or is missing
+    local -a ex; mapfile -t ex < <(excludes)
+    rsync -rlcn --out-format='%n' "${ex[@]}" "$1/" "$STACK_DIR/" | grep -v '/$' || true
+}
+
+apply() {   # apply <new release dir> <old release dir|"">: STACK_DIR's released files become <new>'s
+    local new="$1" old="$2" f
+    local -a ex; mapfile -t ex < <(excludes)
+    rsync -rlpc --chown=root:root "${ex[@]}" "$new/" "$STACK_DIR/" || return 1
+    [[ -n "$old" && -d "$old" ]] || return 0
+    # Files the old release had and the new one doesn't: remove them, or a
+    # deleted compose include would keep running.
+    while IFS= read -r f; do
+        [[ -e "$new/$f" || -L "$new/$f" ]] || rm -f -- "${STACK_DIR:?}/$f"
+    done < <(cd "$old" && find . \( -type f -o -type l \) -printf '%P\n')
+}
+
+compose_up() {
+    log "docker compose up (waits for every service, up to ${WAIT_TIMEOUT}s)"
+    (cd "$STACK_DIR" && docker compose config --quiet) || { log "compose configuration is invalid"; return 1; }
+    (cd "$STACK_DIR" && docker compose up -d --build --wait --wait-timeout "$WAIT_TIMEOUT") || return 1
+    local p
+    for p in "${POST_LIST[@]}"; do
+        log "Running $p"
+        (cd "$STACK_DIR" && bash "$p") || { log "$p failed"; return 1; }
+    done
+}
+
+prune() {   # keep the live release and the one before it
+    local keep_a="$1" keep_b="$2" d
+    for d in "$RELEASES"/*; do
+        [[ -d "$d" ]] || continue
+        case "$(basename "$d")" in "$keep_a"|"$keep_b") ;; *) rm -rf "$d" ;; esac
+    done
+}
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+APPLIED=false; DONE=false; OLD_SHA=""; OLD_DIGEST=""; NEW_SHA=""; NEW_DIGEST=""; ACTION=""
+
+recover() {
+    local rc=$?
+    trap - EXIT
+    if [[ "$DONE" == true || "$rc" -eq 0 ]]; then exit "$rc"; fi
+    if [[ "$APPLIED" == true ]]; then
+        if [[ -n "$OLD_SHA" && -d "$RELEASES/$OLD_SHA" ]]; then
+            log "$ACTION failed; restoring release $OLD_SHA"
+            if apply "$RELEASES/$OLD_SHA" "$RELEASES/$NEW_SHA" && compose_up; then
+                log "Previous release $OLD_SHA is running again"
+                record "$ACTION" rolled-back "$NEW_SHA" "$NEW_DIGEST" "restored=$OLD_SHA"
+            else
+                log "CRITICAL: the previous release did not come back healthy; inspect $STACK_DIR"
+                record "$ACTION" failed-critical "$NEW_SHA" "$NEW_DIGEST" "restore-failed=$OLD_SHA"
+            fi
+        else
+            log "CRITICAL: $ACTION failed and there is no previous release to restore"
+            record "$ACTION" failed-critical "$NEW_SHA" "$NEW_DIGEST" no-previous
+        fi
+    else
+        record "$ACTION" failed "${NEW_SHA:--}" "${NEW_DIGEST:--}" nothing-changed
+    fi
+    heartbeat fail
+    exit "$rc"
+}
+
+cmd_deploy() {
+    local sha="$1" digest="${2:-}" changed
+    require_match sha "$sha" '^[0-9a-f]{40}$'
+    [[ -z "$digest" ]] || require_match digest "$digest" '^sha256:[0-9a-f]{64}$'
+    ACTION=deploy; NEW_SHA="$sha"; NEW_DIGEST="$digest"
+    [[ -d "$STACK_DIR" && -f "$STACK_DIR/.env" ]] || die "$STACK_DIR is not installed (no .env); install it by hand first, then adopt"
+    if [[ -n "$PROMOTE_FROM" ]]; then
+        [[ -n "$digest" ]] || die "$ENV_NAME only accepts promoted releases: a digest is required"
+        was_live_on "$PROMOTE_FROM" "$sha" "$digest" ||
+            die "Release $sha ($digest) was never verified live on $PROMOTE_FROM; refusing to promote"
+    fi
+    read -r OLD_SHA OLD_DIGEST <<<"$(current)"
+    [[ -n "$OLD_SHA" && -d "$RELEASES/$OLD_SHA" ]] ||
+        die "No adopted release for $APP/$ENV_NAME: run 'algo3-deploy-stack adopt $APP $ENV_NAME <sha-on-disk>' once"
+
+    # Edits made on the server since the live release, BEFORE anything changes.
+    changed="$(drift "$RELEASES/$OLD_SHA")"
+    if [[ -n "$changed" ]]; then
+        printf '  %s\n' "${changed//$'\n'/$'\n  '}" >&2
+        die "$STACK_DIR has changes that are not in release $OLD_SHA (listed above). Commit them to the repo (or undo them), then deploy again."
+    fi
+
+    fetch_bundle "$sha" "$digest"; NEW_DIGEST="$DIGEST"
+    if [[ "$sha" == "$OLD_SHA" ]]; then
+        log "Release $sha is already live; checking the services"
+        (cd "$STACK_DIR" && docker compose up -d --wait --wait-timeout "$WAIT_TIMEOUT") || die "$sha is live but not healthy"
+        DONE=true; record deploy noop "$sha" "$NEW_DIGEST" already-live; heartbeat ok
+        return 0
+    fi
+
+    log "Applying release $sha over $OLD_SHA"
+    APPLIED=true
+    apply "$RELEASES/$sha" "$RELEASES/$OLD_SHA" || die "Could not copy the release into $STACK_DIR"
+    compose_up || die "Release $sha did not come up healthy"
+
+    printf '%s %s\n' "$sha" "$NEW_DIGEST" > "$CURRENT_FILE"
+    printf '%s %s\n' "$OLD_SHA" "$OLD_DIGEST" > "$CURRENT_FILE.previous"
+    history_add "$sha" "$NEW_DIGEST"
+    prune "$sha" "$OLD_SHA"
+    DONE=true
+    record deploy ok "$sha" "$NEW_DIGEST" "previous=$OLD_SHA"
+    heartbeat ok
+    log "Deployed $APP/$ENV_NAME $sha (rollback retained: $OLD_SHA)"
+}
+
+cmd_rollback() {
+    local prev_sha prev_digest changed
+    ACTION=rollback
+    read -r OLD_SHA OLD_DIGEST <<<"$(current)"
+    [[ -f "$CURRENT_FILE.previous" ]] || die "No retained release to roll back to"
+    read -r prev_sha prev_digest < "$CURRENT_FILE.previous"
+    [[ -d "$RELEASES/$prev_sha" ]] || die "Release $prev_sha is no longer on disk"
+    changed="$(drift "$RELEASES/$OLD_SHA")"
+    [[ -z "$changed" ]] || { printf '  %s\n' "${changed//$'\n'/$'\n  '}" >&2; die "$STACK_DIR has changes not in $OLD_SHA; resolve them first"; }
+    NEW_SHA="$prev_sha"; NEW_DIGEST="$prev_digest"
+    log "Rolling $APP/$ENV_NAME back from $OLD_SHA to $prev_sha"
+    APPLIED=true
+    apply "$RELEASES/$prev_sha" "$RELEASES/$OLD_SHA" || die "Could not copy release $prev_sha"
+    compose_up || die "Release $prev_sha did not come up healthy"
+    printf '%s %s\n' "$prev_sha" "$prev_digest" > "$CURRENT_FILE"
+    printf '%s %s\n' "$OLD_SHA" "$OLD_DIGEST" > "$CURRENT_FILE.previous"
+    DONE=true
+    record rollback ok "$prev_sha" "$prev_digest" "from=$OLD_SHA"
+    heartbeat ok
+    log "Rolled back. Rolling back again returns to $OLD_SHA."
+}
+
+cmd_adopt() {
+    local sha="$1" digest="${2:-}" changed
+    require_match sha "$sha" '^[0-9a-f]{40}$'
+    [[ -z "$digest" ]] || require_match digest "$digest" '^sha256:[0-9a-f]{64}$'
+    ACTION=adopt; NEW_SHA="$sha"
+    [[ -f "$STACK_DIR/.env" ]] || die "$STACK_DIR has no .env: install the stack first"
+    [[ -z "$(current)" ]] || die "$APP/$ENV_NAME already has a release ($(current)); adopt is only for the first time"
+    fetch_bundle "$sha" "$digest"; NEW_DIGEST="$DIGEST"
+    changed="$(drift "$RELEASES/$sha")"
+    if [[ -n "$changed" ]]; then
+        printf '  %s\n' "${changed//$'\n'/$'\n  '}" >&2
+        rm -rf "${RELEASES:?}/$sha"
+        die "$STACK_DIR differs from $sha in the files above: adopt the commit that is really installed, or commit the server's changes first"
+    fi
+    printf '%s %s\n' "$sha" "$NEW_DIGEST" > "$CURRENT_FILE"
+    DONE=true
+    record adopt ok "$sha" "$NEW_DIGEST" "stack=$STACK_DIR"
+    log "Adopted $sha as the live release of $APP/$ENV_NAME; deploys from CI now compare against it"
+}
+
+cmd_status() {
+    printf 'kind: stack\nstack: %s\nlive: %s\n' "$STACK_DIR" "$(current)"
+    [[ -f "$CURRENT_FILE.previous" ]] && printf 'rollback: %s\n' "$(cat "$CURRENT_FILE.previous")"
+    local sha changed
+    read -r sha _ <<<"$(current)"
+    if [[ -n "$sha" && -d "$RELEASES/$sha" ]]; then
+        changed="$(drift "$RELEASES/$sha")"
+        if [[ -n "$changed" ]]; then printf 'drift: %s\n' "${changed//$'\n'/$'\ndrift: '}"; else printf 'drift: none\n'; fi
+    fi
+    (cd "$STACK_DIR" && docker compose ps --format '{{.Name}}  {{.State}}  {{.Health}}') 2>/dev/null || true
+}
+
+main() {
+    [[ $# -ge 3 ]] || die "Usage: algo3-deploy-stack deploy|rollback|status|adopt <app> <env> [sha] [digest]"
+    local command="$1"
+    APP="$2"; ENV_NAME="$3"; shift 3
+    require_match app "$APP" '^[a-z][a-z0-9-]{1,40}$'
+    require_match env "$ENV_NAME" '^[a-z][a-z0-9-]{0,20}$'
+    [[ $EUID -eq 0 ]] || die "Must run as root (through algo3-deploy-wrapper or sudo)"
+    for cmd in docker rsync flock curl; do command -v "$cmd" >/dev/null || die "Required command unavailable: $cmd"; done
+    load
+    case "$command" in
+        status) cmd_status; return 0 ;;
+        deploy|rollback|adopt) ;;
+        *) die "Unknown command: $command" ;;
+    esac
+    mkdir -p "$LOCK_DIR" "$RELEASES"
+    exec 9>"$LOCK_DIR/$APP-$ENV_NAME.lock"
+    flock -n 9 || die "Another deploy or rollback of $APP/$ENV_NAME is running"
+    trap recover EXIT
+    case "$command" in
+        deploy)   [[ $# -ge 1 && $# -le 2 ]] || die "Usage: deploy <app> <env> <sha> [digest]"; cmd_deploy "$@" ;;
+        adopt)    [[ $# -ge 1 && $# -le 2 ]] || die "Usage: adopt <app> <env> <sha> [digest]"; cmd_adopt "$@" ;;
+        rollback) [[ $# -eq 0 ]] || die "Usage: rollback <app> <env>"; cmd_rollback ;;
+    esac
+}
+
+main "$@"

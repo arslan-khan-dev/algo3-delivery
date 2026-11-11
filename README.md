@@ -39,9 +39,10 @@ server: ssh (key pinned to one env: one app, or --any-app) ─► algo3-deploy-s
 | `server/test/run.sh` | The test suite. It fakes docker and curl and covers every failure path |
 | `edge/` | `algo3-edge`, the single Caddy container on 80/443, its installer, and `CUTOVER.md` |
 | `turn/` | `algo3-turn`, coturn for nexwe's calls (host network, relays to the public internet only), with its config template |
-| `server/apps/biruno/`, `server/apps/nexwe/` | biruno (custom SSE template) and the nexwe API (`OVERLAP=false`), each staging + production |
+| `server/apps/biruno/`, `server/apps/nexwe/` | biruno (custom SSE template) and the nexwe API (`OVERLAP=false`), each staging + production; staging on the `studio-staging` network (the staging platform) |
+| `server/apps/studio-platform/`, `server/bin/algo3-deploy-stack` | `KIND=stack`: studio-platform itself, a compose stack deployed from CI like an app. The release is a bundle image of its repo; a deploy refuses hand edits on the server (drift), keeps `.env` and per-host files, waits for every service, and puts the previous release back if one is unhealthy. `adopt` once, then CI |
 | `docs/rollout-nexwe-website.md` | Phase 4: GitHub settings, deploy keys, the first automatic deploys |
-| `lab/` | A local stand-in for the VPS. Every server step is rehearsed there first. **Start with `lab/GUIDE.md`**: the step-by-step guide, from the first test to the server. `rehearse-platform.sh` (studio-platform's core) and `rehearse-products.sh` (biruno + nexwe on it) follow Phase 3 |
+| `lab/` | A local stand-in for the VPS. Every server step is rehearsed there first. **Start with `lab/GUIDE.md`**: the step-by-step guide, from the first test to the server. `rehearse-platform.sh` (studio-platform's core) and `rehearse-products.sh` (biruno + nexwe on it) follow Phase 3; `rehearse-platform-staging.sh` adds the staging platform, moves the staging products onto it and deploys the platform from CI |
 | `server/baseline/baseline.sh` | Server baseline, one component at a time: `sysctl`, `apt`, `docker`, `timers`, `ops`, `ssh` |
 | `server/baseline/ops/` | autoheal (restarts unhealthy containers) + Netdata (alerts by email, through healthchecks.io), pinned by digest |
 | `server/baseline/bin/` | Heartbeat to healthchecks.io (every 5 min), pending-reboot alert (daily), image prune (weekly; never containers) |
@@ -52,6 +53,7 @@ server: ssh (key pinned to one env: one app, or --any-app) ─► algo3-deploy-s
 ```bash
 sudo /usr/local/libexec/algo3-deploy status   nexwe-website production   # what is live / retained
 sudo /usr/local/libexec/algo3-deploy rollback nexwe-website production   # previous release, seconds
+sudo /usr/local/libexec/algo3-deploy status   studio-platform staging     # a stack: live release, drift, services
 tail -n 20 /var/log/algo3/deploys.log                                     # every deploy and rollback
 journalctl -u 'algo3-deploy-nexwe-website-*' --since today                # full output of a deploy
 ```
@@ -64,6 +66,7 @@ merge it to `main`. The `rollback` command is the emergency path.
 ```bash
 docker run --rm -v "$PWD/server:/src:ro" python:3.12-slim \
   bash -c 'apt-get update -qq && apt-get install -y -qq sudo >/dev/null && bash /src/test/run.sh'
-docker run --rm -v "$PWD/server:/mnt:ro" koalaman/shellcheck:v0.11.0 -x bin/* install.sh test/run.sh
+docker run --rm -v "$PWD/server:/src:ro" python:3.12-slim   bash -c 'apt-get update -qq && apt-get install -y -qq sudo rsync >/dev/null && bash /src/test/stack.sh'
+docker run --rm -v "$PWD/server:/mnt:ro" -w /mnt koalaman/shellcheck:v0.11.0 -x   bin/algo3-cert-watch bin/algo3-deploy bin/algo3-deploy-ssh bin/algo3-deploy-stack bin/algo3-deploy-wrapper   install.sh test/run.sh test/stack.sh test/stack-stubs/docker test/stack-stubs/curl
 docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -no-color
 ```

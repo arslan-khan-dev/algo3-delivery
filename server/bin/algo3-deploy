@@ -951,6 +951,11 @@ main() {
     require_match app "$APP" '^[a-z][a-z0-9-]{1,40}$'
     require_match env "$ENV_NAME" '^[a-z][a-z0-9-]{0,20}$'
     [[ $EUID -eq 0 ]] || die "Must run as root (through algo3-deploy-wrapper or sudo)"
+    # A compose STACK (studio-platform) is not blue/green: its own program
+    # deploys it, behind the same wrapper, key and promotion rules.
+    if grep -qE '^KIND="?stack"?[[:space:]]*$' "$ETC/apps/$APP/$ENV_NAME.conf" 2>/dev/null; then
+        exec "${ALGO3_STACK_DEPLOY:-/usr/local/libexec/algo3-deploy-stack}" "$command" "$APP" "$ENV_NAME" "$@"
+    fi
     for cmd in docker curl flock python3 install; do
         command -v "$cmd" >/dev/null || die "Required command unavailable: $cmd"
     done

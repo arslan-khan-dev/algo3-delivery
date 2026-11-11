@@ -31,7 +31,10 @@ services:
       - /etc/algo3/caddy:/etc/algo3/caddy:ro
       - data:/data
       - config:/config
-    networks: [studio]
+    # Both platforms' networks: the edge reaches each site's container by its
+    # unique name (container names, never a service name such as `seaweedfs`,
+    # which both platforms have).
+    networks: [studio, studio-staging]
     labels:
       autoheal: 'true'
     healthcheck:
@@ -45,6 +48,9 @@ networks:
   # Created once with `docker network create studio`; every project joins it
   # as external, so no single project owns (or can delete) it.
   studio:
+    external: true
+  # The staging platform and the staging apps that use it (edge/install.sh).
+  studio-staging:
     external: true
 
 volumes:

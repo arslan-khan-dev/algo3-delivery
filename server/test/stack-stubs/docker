@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Fake `docker` for test/stack.sh. Bundles are directories under
+# $STUB_DIR/registry/<sha>/ (their digest in <sha>.digest). `compose up` fails
+# when the stack directory's VERSION is listed in $STUB_DIR/broken.
+set -euo pipefail
+log() { printf '%s\n' "$*" >> "$STUB_DIR/docker.log"; }
+log "docker $*"
+case "$1" in
+    pull)
+        ref="$2"; sha="${ref##*:}"
+        [[ -d "$STUB_DIR/registry/$sha" ]] || { echo "manifest unknown" >&2; exit 1; } ;;
+    image)
+        ref="${*: -1}"; sha="${ref##*:}"; image="${ref%:*}"
+        printf '["%s@%s"]\n' "$image" "$(cat "$STUB_DIR/registry/$sha.digest")" ;;
+    create)
+        ref="$2"; digest="${ref##*@}"
+        for d in "$STUB_DIR"/registry/*.digest; do
+            [[ "$(cat "$d")" == "$digest" ]] && { basename "$d" .digest; exit 0; }
+        done
+        echo "no such image" >&2; exit 1 ;;
+    cp)
+        src="${2%%:*}"; dest="$3"
+        cp -a "$STUB_DIR/registry/$src/." "$dest" ;;
+    rm) ;;
+    compose)
+        shift
+        case "$1" in
+            config) ;;
+            up)
+                version="$(cat VERSION 2>/dev/null || true)"
+                printf 'up %s\n' "$version" >> "$STUB_DIR/compose.log"
+                if grep -qx "$version" "$STUB_DIR/broken" 2>/dev/null; then
+                    echo "container studio-ai is unhealthy" >&2; exit 1
+                fi ;;
+            ps) echo "studio-postgres  running  healthy" ;;
+            *) echo "stub: compose $1 not faked" >&2; exit 2 ;;
+        esac ;;
+    *) echo "stub: docker $1 not faked" >&2; exit 2 ;;
+esac
