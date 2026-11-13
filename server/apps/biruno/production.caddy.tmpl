@@ -1,7 +1,16 @@
-# biruno, production. A custom template (the generated site cannot express
-# these two): AI answers stream as Server-Sent Events, so every chunk is
-# flushed at once (flush_interval -1), and uploads are capped at 25 MB here.
-# Deliberately no `encode`: compressing a stream can hold chunks back.
+# biruno, production. A custom template, because the generated site cannot express this:
+#
+#   {{HOSTNAME}} (app.birunoai.com)  the web app AND the API (one container).
+#   api.birunoai.com  the API: /api/* only; anything else is sent to the app.
+#   birunoai.com, www.birunoai.com
+#       kept for the marketing site (not built yet). Until then: /api/* still
+#       reaches the API, because installed desktop builds have this host baked
+#       in; everything else goes to the app with a TEMPORARY 302, so browsers
+#       do not remember it once the marketing site takes the domain.
+#
+# Every block streams AI answers as Server-Sent Events (flush_interval -1, and
+# deliberately no `encode`, which can hold chunks back) and caps uploads at 25 MB.
+# The deployer requires the hosts here to be exactly HOSTNAME + ALIASES.
 {{HOSTNAME}} {
 	request_body {
 		max_size 25MB
@@ -16,6 +25,40 @@
 	}
 }
 
-www.birunoai.com {
-	redir https://birunoai.com{uri} permanent
+api.birunoai.com {
+	handle /api/* {
+		request_body {
+			max_size 25MB
+		}
+		reverse_proxy {{UPSTREAM}} {
+			flush_interval -1
+			lb_try_duration 5s
+			lb_try_interval 50ms
+			transport http {
+				dial_timeout 300ms
+			}
+		}
+	}
+	handle {
+		redir https://app.birunoai.com{uri} 302
+	}
+}
+
+birunoai.com, www.birunoai.com {
+	handle /api/* {
+		request_body {
+			max_size 25MB
+		}
+		reverse_proxy {{UPSTREAM}} {
+			flush_interval -1
+			lb_try_duration 5s
+			lb_try_interval 50ms
+			transport http {
+				dial_timeout 300ms
+			}
+		}
+	}
+	handle {
+		redir https://app.birunoai.com{uri} 302
+	}
 }

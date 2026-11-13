@@ -34,8 +34,8 @@ probe_stop() {   # prints: requests failures longest-outage-seconds
 # The path real visitors take (network → port 443 → whatever owns it), not
 # loopback, so it is what Phase 3+ measures. It checks the certificate against
 # the lab's CA and sends the real hostname (SNI + Host).
-xprobe_start() {   # xprobe_start <hostname> [probe-name]
-    local host="${1:-nexwe.app}" name="${2:-lab-xprobe}" ip
+xprobe_start() {   # xprobe_start <hostname> [probe-name] [path, default /]
+    local host="${1:-nexwe.app}" name="${2:-lab-xprobe}" path="${3:-/}" ip
     ip="$(docker inspect -f '{{.NetworkSettings.IPAddress}}' algo3-lab)"
     docker rm -f "$name" >/dev/null 2>&1 || true
     # Docker on Windows needs a Windows path, both to copy into and to mount.
@@ -43,11 +43,11 @@ xprobe_start() {   # xprobe_start <hostname> [probe-name]
     mkdir -p "$LAB_DIR/.work"; rm -rf "$LAB_DIR/.work/lab-ca.crt"
     docker cp algo3-lab:/usr/local/share/ca-certificates/lab-caddy-host.crt "$work/lab-ca.crt" >/dev/null
     [[ -f "$LAB_DIR/.work/lab-ca.crt" ]] || { echo "xprobe: could not fetch the lab CA" >&2; return 1; }
-    docker run -d --name "$name" -e "IP=$ip" -e "HOST=$host" \
+    docker run -d --name "$name" -e "IP=$ip" -e "HOST=$host" -e "PROBE_PATH=$path" \
         -v "$work/lab-ca.crt:/ca.crt:ro" \
         python:3.12-slim python -u -c '
 import os, socket, ssl, time
-ip, host = os.environ["IP"], os.environ["HOST"]
+ip, host, path = os.environ["IP"], os.environ["HOST"], os.environ.get("PROBE_PATH", "/")
 ctx = ssl.create_default_context(cafile="/ca.crt")
 while True:
     code = "000"
@@ -55,7 +55,7 @@ while True:
         with socket.create_connection((ip, 443), timeout=1) as raw:
             with ctx.wrap_socket(raw, server_hostname=host) as s:
                 s.settimeout(1)
-                s.sendall(f"GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode())
+                s.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode())
                 code = s.recv(64).split(b" ")[1].decode()
     except Exception:
         pass
