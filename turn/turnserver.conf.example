@@ -22,6 +22,15 @@ static-auth-secret=REPLACE_WITH_TURN_SECRET
 # A small relay range (ufw opens exactly this). ~120 concurrent calls.
 min-port=49160
 max-port=49400
+# ── Bandwidth caps (bytes per second; in and out are counted separately) ──
+# One relayed stream may use 250 KB/s (2 Mbit/s). The app caps call video at
+# 1.5 Mbit/s plus audio, so a normal call never meets this; a client that tries
+# to push more through the relay is held to it.
+max-bps=250000
+# All relays together may use 5 MB/s (40 Mbit/s), about 20 relayed video streams
+# at full rate, so calls can never take the whole server's link from the
+# websites and APIs. Raise it if many calls get choppy at once.
+bps-capacity=5000000
 
 # ── Never a door into this server's private networks ─────────────────────
 # A TURN server relays to any address a client names. Without these lines a

@@ -31,8 +31,15 @@ P=/opt/studio-platform
 PD=platform.lab.test
 BD=biruno.lab.test
 PRODUCTS="$(cd "$LAB_DIR/../.." && pwd)"
-rel() { printf 'products-release-%s' "$1" | sha1sum | cut -c1-40; }
-R1="$(rel 1)"; R2="$(rel 2)"
+S=/opt/studio-platform-staging
+# Release ids are salted per build (step 1 writes the salt into the lab). A rebuilt
+# image has a new digest and the deployer refuses to reuse a container name with
+# another digest, so a re-run must deploy new releases; the deployer's own
+# retention then drops the old ones.
+RUN_FILE=/root/products-run
+rel() { printf 'products-release-%s%s' "$RUN" "$1" | sha1sum | cut -c1-40; }
+set_releases() { RUN="$(docker exec algo3-lab cat "$RUN_FILE" 2>/dev/null)"; RUN="${RUN:+$RUN-}"; R1="$(rel 1)"; R2="$(rel 2)"; }
+set_releases
 
 # Build on the PC (like GitHub), then load into the lab and push to its registry.
 build_into_lab() {   # build_into_lab <name> <context> <dockerfile> <sha>
@@ -47,6 +54,7 @@ build_into_lab() {   # build_into_lab <name> <context> <dockerfile> <sha>
 step1() {
     title "Step 1 · images from the working copies (GitHub's job), into the lab registry"
     local s
+    as_root "date +%s > $RUN_FILE"; set_releases
     for s in "$R1" "$R2"; do
         build_into_lab biruno-ai "$PRODUCTS/biruno-ai" apps/server/Dockerfile "$s" || note "biruno build failed"
         build_into_lab nexwe-api "$PRODUCTS/nexwe/server" Dockerfile "$s" || note "nexwe build failed"
@@ -73,12 +81,16 @@ lab_values() {   # lab_values <product>: writes /root/<product>.vals inside the 
     docker exec -i -e P="$1" algo3-lab python3 - <<'PY'
 import json, os, re, secrets, subprocess
 p = os.environ['P']; db = p.replace('-', '_'); up = db.upper()
+# Staging products live on the staging platform (own postgres, S3 keys, .env).
+stg = p.endswith('-staging')
+pg = 'studio-staging-postgres' if stg else 'studio-postgres'
+root = '/opt/studio-platform-staging' if stg else '/opt/studio-platform'
 pw = secrets.token_hex(16)
-subprocess.run(['docker', 'exec', 'studio-postgres', 'psql', '-U', 'postgres', '-q', '-c',
+subprocess.run(['docker', 'exec', pg, 'psql', '-U', 'postgres', '-q', '-c',
                 f"ALTER ROLE \"{db}\" PASSWORD '{pw}'"], check=True)
-ids = json.load(open('/opt/studio-platform/scripts/s3-identities.json'))['identities']
+ids = json.load(open(f'{root}/scripts/s3-identities.json'))['identities']
 cred = next(i for i in ids if i['name'] == p)['credentials'][0]
-env = dict(re.findall(r'^([A-Z0-9_]+)=(.*)$', open('/opt/studio-platform/.env').read(), re.M))
+env = dict(re.findall(r'^([A-Z0-9_]+)=(.*)$', open(f'{root}/.env').read(), re.M))
 vals = {
     'DATABASE_URL': f'postgres://{db}:{pw}@postgres:5432/{db}',
     'STORAGE_BUCKET': f'{p}-files',
@@ -121,7 +133,9 @@ AI_SERVICE_URL=http://ai:8080
 EOF"
         p=nexwe; [[ $e == staging ]] && p=nexwe-staging
         o=https://api.nexwe.app; [[ $e == staging ]] && o=https://staging-api.nexwe.app
+        h=768; [[ $e == staging ]] && h=384
         as_root "umask 077; cat > /etc/algo3/apps/nexwe/$e.env <<EOF
+NODE_OPTIONS=--max-old-space-size=$h
 DATABASE_URL=$(v $p DATABASE_URL)
 JWT_SECRET=$(openssl rand -hex 32)
 PUBLIC_API_URL=$o
@@ -162,27 +176,34 @@ step4() {
 step5() {
     title "Step 5 · nexwe: OVERLAP=false, prisma migrations, sockets"
     run "sudo $D deploy nexwe staging $R1 2>&1 | tail -3"
-    check "prisma migrations applied before the switch" "u=\$(grep ^DATABASE_URL= /etc/algo3/apps/nexwe/staging.env | cut -d= -f2-); [ \"\$(docker exec studio-postgres psql \"\${u/@postgres:/@localhost:}\" -Atc 'select count(*) from _prisma_migrations where finished_at is not null')\" -ge 30 ]"
+    check "prisma migrations applied before the switch" "u=\$(grep ^DATABASE_URL= /etc/algo3/apps/nexwe/staging.env | cut -d= -f2-); [ \"\$(docker exec studio-staging-postgres psql \"\${u/@postgres:/@localhost:}\" -Atc 'select count(*) from _prisma_migrations where finished_at is not null')\" -ge 30 ]"
     check "health reports the release through the edge" "curl -fsS https://staging-api.nexwe.app/health | grep -q '\"version\":\"$R1\"'"
     check "Socket.IO handshake through the edge" "curl -fsS 'https://staging-api.nexwe.app/socket.io/?EIO=4&transport=polling' | grep -q '\"sid\"'"
     as_root 'rm -f /tmp/n-max; ( max=0; while [ ! -f /tmp/n-stop ]; do n=$(docker ps -q --filter label=algo3.app=nexwe --filter label=algo3.env=staging | wc -l); [ "$n" -gt "$max" ] && max=$n; echo $max > /tmp/n-max; sleep 0.1; done ) >/dev/null 2>&1 & sleep 0.5'
-    run "d=\$(docker image inspect -f '{{index .RepoDigests 0}}' $REG/nexwe-api:$R2 | cut -d@ -f2); sudo $D deploy nexwe staging $R2 \$d 2>&1 | tail -2"
+    run "d=\$(sudo docker image inspect -f '{{index .RepoDigests 0}}' $REG/nexwe-api:$R2 | cut -d@ -f2); sudo $D deploy nexwe staging $R2 \$d 2>&1 | tail -2"
     as_root 'touch /tmp/n-stop; sleep 0.4; rm -f /tmp/n-stop'
     check "never two nexwe copies at once" '[ "$(cat /tmp/n-max)" -le 1 ]'
     check "the old release stopped cleanly on SIGTERM (exit 0)" "[ \"\$(docker inspect -f '{{.State.ExitCode}}' nexwe-staging-${R1:0:12})\" = 0 ] && docker logs nexwe-staging-${R1:0:12} 2>&1 | grep -q 'SIGTERM: shutting down'"
     check "Socket.IO answers again on the new release" "curl -fsS 'https://staging-api.nexwe.app/socket.io/?EIO=4&transport=polling' | grep -q '\"sid\"' && curl -fsS https://staging-api.nexwe.app/health | grep -q $R2"
     run "d=\$(sudo awk -v s=$R2 '\$2==s {d=\$3} END {print d}' /var/lib/algo3/nexwe/staging.history); sudo $D deploy nexwe production $R2 \$d 2>&1 | tail -2"
     check "nexwe production serves the promoted release" "curl -fsS https://api.nexwe.app/health | grep -q $R2"
+    check "nexwe production: 1 GB memory limit" "[ \"\$(docker inspect -f '{{.HostConfig.Memory}}' nexwe-production-${R2:0:12})\" = 1073741824 ]"
+    check "nexwe production: Node's heap capped at ~768 MB (below the limit)" "h=\$(docker exec nexwe-production-${R2:0:12} node -p 'Math.round(require(\"v8\").getHeapStatistics().heap_size_limit/1048576)'); [ \"\$h\" -ge 768 ] && [ \"\$h\" -lt 900 ]"
+    check "nexwe staging: 512 MB limit, heap ~384 MB" "[ \"\$(docker inspect -f '{{.HostConfig.Memory}}' nexwe-staging-${R2:0:12})\" = 536870912 ] && h=\$(docker exec nexwe-staging-${R2:0:12} node -p 'Math.round(require(\"v8\").getHeapStatistics().heap_size_limit/1048576)') && [ \"\$h\" -ge 384 ] && [ \"\$h\" -lt 480 ]"
+    check "nexwe logs rotate (json-file, 10m x 5)" "[ \"\$(docker inspect -f '{{.HostConfig.LogConfig.Type}} {{index .HostConfig.LogConfig.Config \"max-size\"}} {{index .HostConfig.LogConfig.Config \"max-file\"}}' nexwe-production-${R2:0:12})\" = 'json-file 10m 5' ]"
 }
 
 step6() {
     title "Step 6 · coturn (calls)"
     as_root "install -d -m 0700 /opt/algo3/turn && cp /lab/algo3-delivery/turn/compose.yml /opt/algo3/turn/ \
       && sed -e 's/REPLACE_WITH_TURN_SECRET/\$(openssl rand -hex 32)/' -e 's/179.236.229.2/'\$(hostname -I | awk '{print \$1}')'/' /lab/algo3-delivery/turn/turnserver.conf.example > /opt/algo3/turn/turnserver.conf \
-      && docker compose -p algo3-turn -f /opt/algo3/turn/compose.yml up -d >/dev/null 2>&1; sleep 4"
+      && docker compose -p algo3-turn -f /opt/algo3/turn/compose.yml up -d --force-recreate >/dev/null 2>&1; sleep 4"
     check "coturn listens on 3478 (udp and tcp)" 'ss -lun | grep -q ":3478 " && ss -ltn | grep -q ":3478 "'
     check "its folder is root-only (the secret is in it)" '[ "$(stat -c %a /opt/algo3/turn)" = 700 ]'
     check "the secret is not on its command line" '! docker inspect -f "{{json .Args}}" algo3-turn | grep -q static-auth-secret'
+    check "coturn accepted the bandwidth caps (still running, no config error)" 'sleep 2; [ "$(docker inspect -f "{{.State.Running}} {{.RestartCount}}" algo3-turn)" = "true 0" ] && ! docker logs algo3-turn 2>&1 | grep -qiE "unknown|bad configuration|unrecognized"'
+    check "coturn reports the caps it runs with" 'docker logs algo3-turn 2>&1 | grep -q "5000000 bytes per second allowed, combined server capacity"'
+    check "coturn image pinned by digest; logs rotate (10m x 5)" '[ "$(docker inspect -f "{{.Config.Image}}" algo3-turn | grep -c @sha256:)" = 1 ] && [ "$(docker inspect -f "{{index .HostConfig.LogConfig.Config \"max-size\"}} {{index .HostConfig.LogConfig.Config \"max-file\"}}" algo3-turn)" = "10m 5" ]'
 }
 
 step7() {
@@ -192,5 +213,11 @@ step7() {
 }
 
 [[ $# -gt 0 ]] || set -- 1 2 3 4 5 6 7
+# Docker rewrites /etc/hosts whenever the lab restarts. Without these names the
+# checks' curl https://nexwe.app, staging-api.nexwe.app ... reach the REAL servers.
+as_root "grep -q 'files-staging.$PD' /etc/hosts || echo '127.0.0.1 nexwe.app www.nexwe.app staging.nexwe.app api.nexwe.app staging-api.nexwe.app files.$PD files-staging.$PD mail.$PD auth-demo.$PD auth-demo-staging.$PD auth-biruno.$PD auth-biruno-staging.$PD $BD www.$BD staging.$BD app.$BD api.$BD staging-app.$BD staging-api.$BD' >> /etc/hosts"
+for n in nexwe.app api.nexwe.app staging-api.nexwe.app "files.$PD"; do
+    as_root "getent hosts $n | grep -q '^127\.0\.0\.1 '" || { echo "STOP: $n does not point at the lab; refusing to run checks against a real server"; exit 1; }
+done
 for s in "$@"; do "step$s"; done
 finish

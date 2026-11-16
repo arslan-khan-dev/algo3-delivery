@@ -57,6 +57,16 @@ expect "production S3_ENDPOINT stays files." "$(val /tmp/c1/apps/production.env 
 expect "staging's database comes from the staging platform" "$(val /tmp/c1/apps/staging.env DATABASE_URL | sed 's/.*platform=//')" staging
 expect "production's database comes from production's" "$(val /tmp/c1/apps/production.env DATABASE_URL | sed 's/.*platform=//')" production
 expect "staging's bucket" "$(val /tmp/c1/apps/staging.env S3_BUCKET)" nexwe-staging-files
+expect "production heap cap" "$(val /tmp/c1/apps/production.env NODE_OPTIONS)" --max-old-space-size=768
+expect "staging heap cap" "$(val /tmp/c1/apps/staging.env NODE_OPTIONS)" --max-old-space-size=384
+# The heap must leave room under the container's limit, or the kernel kills Node
+# before Node collects garbage. Ties make-env.sh to each <env>.conf's MEM_LIMIT.
+for e in production staging; do
+    heap="$(val /tmp/c1/apps/$e.env NODE_OPTIONS | sed 's/.*=//')"
+    lim="$(val "$SRC/apps/nexwe/$e.conf" MEM_LIMIT)"
+    case "$lim" in *g) mb=$(( ${lim%g} * 1024 ));; *m) mb=${lim%m};; esac
+    if (( heap * 4 <= mb * 3 )); then ok "$e heap $heap MB is at most 3/4 of MEM_LIMIT $lim"; else bad "$e heap $heap MB is at most 3/4 of MEM_LIMIT $lim"; fi
+done
 
 echo "Case 2: one platform for both (no staging platform installed)"
 rm -rf /tmp/c2; platform /tmp/c2/prod production

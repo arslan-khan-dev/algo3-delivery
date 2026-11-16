@@ -78,12 +78,15 @@ turn_secret="$(cat "$APPS/turn-secret")"
 for e in staging production; do
     product=nexwe; origin=https://api.nexwe.app; platform="$PLATFORM"
     [[ $e == staging ]] && product=nexwe-staging && origin=https://staging-api.nexwe.app && platform="$STAGING_PLATFORM"
+    # Node's heap stays below the container's MEM_LIMIT (<env>.conf): 768 of 1g, 384 of 512m.
+    heap=768; [[ $e == staging ]] && heap=384
     block="$(bash "$platform/scripts/product-env.sh" "$product" --rotate-db-password)"
     get() { sed -n "s/^$1=//p" <<<"$block"; }
     [[ "$(get DATABASE_URL)" == postgres://* ]] || die "no database URL for $product"
     [[ "$(get STORAGE_PUBLIC_ENDPOINT)" == https://* ]] || die "no public files address for $product"
     cat > "$APPS/$e.env" <<EOF
 NODE_ENV=production
+NODE_OPTIONS=--max-old-space-size=$heap
 DATABASE_URL=$(get DATABASE_URL)
 JWT_SECRET=$(openssl rand -hex 32)
 PUBLIC_API_URL=$origin

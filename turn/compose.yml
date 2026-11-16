@@ -6,6 +6,10 @@
 #   sudo cp turn/turnserver.conf.example /opt/algo3/turn/turnserver.conf   # then fill in the secret
 #   sudo docker compose -p algo3-turn -f /opt/algo3/turn/compose.yml up -d
 #
+# coturn reads turnserver.conf only at start. After editing it, restart it
+# (calls being set up retry; calls already connected peer-to-peer are not affected):
+#   sudo docker restart algo3-turn
+#
 # NOT blue/green: it holds no release, changes rarely, and a restart only makes
 # calls that are being set up retry. Upgrade in a quiet hour.
 #
