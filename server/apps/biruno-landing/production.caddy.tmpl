@@ -1,0 +1,53 @@
+# biruno-landing, production. A custom template, because the generated site cannot express this:
+#
+#   {{HOSTNAME}} (birunoai.com)  the marketing site, plus two things it inherited
+#       from the biruno app when it took this domain over (2026-11):
+#       - /api/* still reaches the biruno API: installed desktop builds have this
+#         host baked in (new builds use api.birunoai.com). SSE streaming, 25 MB uploads.
+#       - the web app's old page addresses (sign-in emails, bookmarks) go to
+#         app.birunoai.com with a TEMPORARY 302, path kept, as before the takeover.
+#   www.birunoai.com  the same /api/*; everything else redirects permanently to
+#       https://birunoai.com (not REDIRECTS=, which would also redirect /api/*).
+#
+# The deployer requires the hosts here to be exactly HOSTNAME + ALIASES.
+# biruno-production is the biruno app's stable name on the studio network.
+(landing_biruno_api_production) {
+	handle /api/* {
+		request_body {
+			max_size 25MB
+		}
+		reverse_proxy biruno-production:8100 {
+			flush_interval -1
+			lb_try_duration 5s
+			lb_try_interval 50ms
+			transport http {
+				dial_timeout 300ms
+			}
+		}
+	}
+}
+
+{{HOSTNAME}} {
+	import landing_biruno_api_production
+	@app path /login /login/* /auth/* /app /app/* /credits /credits/* /documents /documents/* /resumes /resumes/* /sessions /sessions/* /usage /usage/* /users /users/* /admin /admin/*
+	handle @app {
+		redir https://app.birunoai.com{uri} 302
+	}
+	handle {
+		encode zstd gzip
+		reverse_proxy {{UPSTREAM}} {
+			lb_try_duration 5s
+			lb_try_interval 50ms
+			transport http {
+				dial_timeout 300ms
+			}
+		}
+	}
+}
+
+www.birunoai.com {
+	import landing_biruno_api_production
+	handle {
+		redir https://{{HOSTNAME}}{uri} permanent
+	}
+}

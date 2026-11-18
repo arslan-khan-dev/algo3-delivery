@@ -1,0 +1,47 @@
+# biruno-landing, staging. A custom template, because the generated site cannot express this:
+#
+#   {{HOSTNAME}} (staging.birunoai.com)  the marketing site's staging, plus what it
+#       inherited from biruno's staging when it took this domain over (2026-11):
+#       - /api/* still reaches the biruno STAGING API (staging desktop builds).
+#       - the web app's old page addresses go to staging-app.birunoai.com with a
+#         TEMPORARY 302, path kept.
+#   Never indexed (a template sets X-Robots-Tag itself; NOINDEX= only applies to
+#   generated sites).
+#
+# The deployer requires the hosts here to be exactly HOSTNAME + ALIASES.
+# biruno-staging is the biruno app's stable name on the studio-staging network,
+# which the edge is also on.
+(landing_biruno_api_staging) {
+	handle /api/* {
+		request_body {
+			max_size 25MB
+		}
+		reverse_proxy biruno-staging:8100 {
+			flush_interval -1
+			lb_try_duration 5s
+			lb_try_interval 50ms
+			transport http {
+				dial_timeout 300ms
+			}
+		}
+	}
+}
+
+{{HOSTNAME}} {
+	header X-Robots-Tag "noindex, nofollow, noarchive"
+	import landing_biruno_api_staging
+	@app path /login /login/* /auth/* /app /app/* /credits /credits/* /documents /documents/* /resumes /resumes/* /sessions /sessions/* /usage /usage/* /users /users/* /admin /admin/*
+	handle @app {
+		redir https://staging-app.birunoai.com{uri} 302
+	}
+	handle {
+		encode zstd gzip
+		reverse_proxy {{UPSTREAM}} {
+			lb_try_duration 5s
+			lb_try_interval 50ms
+			transport http {
+				dial_timeout 300ms
+			}
+		}
+	}
+}

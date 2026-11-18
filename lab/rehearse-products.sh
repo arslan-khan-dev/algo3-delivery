@@ -85,7 +85,13 @@ p = os.environ['P']; db = p.replace('-', '_'); up = db.upper()
 stg = p.endswith('-staging')
 pg = 'studio-staging-postgres' if stg else 'studio-postgres'
 root = '/opt/studio-platform-staging' if stg else '/opt/studio-platform'
-pw = secrets.token_hex(16)
+# Keep the password an existing env file already holds: a running container keeps
+# the env it was created with, so rotating it here breaks every product this run
+# does not redeploy (it did, 2026-11-16: biruno lost its database).
+app = 'biruno' if p.startswith('biruno') else 'nexwe'
+envf = f"/etc/algo3/apps/{app}/{'staging' if stg else 'production'}.env"
+old = re.search(r'^DATABASE_URL=postgres://[^:]+:([^@]+)@', open(envf).read(), re.M) if os.path.exists(envf) else None
+pw = old.group(1) if old else secrets.token_hex(16)
 subprocess.run(['docker', 'exec', pg, 'psql', '-U', 'postgres', '-q', '-c',
                 f"ALTER ROLE \"{db}\" PASSWORD '{pw}'"], check=True)
 ids = json.load(open(f'{root}/scripts/s3-identities.json'))['identities']
