@@ -37,7 +37,7 @@ Open `<repo>/.github/workflows/deliver.yml` (or whichever workflow calls
 | `image` | set `image:` only if it is **not** `ghcr.io/<owner>/<repo name in lowercase>` |
 | `dockerfile` | set `dockerfile:` only if it is not `Dockerfile` |
 | `target` | set `target:` if present |
-| `validate-command` | **not supported by the orb yet**: report it (tests would stop running in CI) and ask before going on |
+| `validate-image`, `validate-command` | copy both as `validate-image:` and `validate-command:` (quote the command in YAML); `node-version: <v>` becomes `validate-image: node:<v>` |
 | `tree-path`, or several jobs calling `deploy-app.yml` | **not supported**: stop, this repo stays on GitHub Actions |
 | `context` other than `.` | **not supported**: stop and report |
 
@@ -79,6 +79,8 @@ workflows:
     jobs:
       - algo3/deliver:
           app: <app>
+          # validate-image: <image>       only if the workflow has validate-image / node-version (step 1)
+          # validate-command: "<command>" only if the workflow has validate-command (step 1)
           # image: ghcr.io/arslan-khan-dev/<name>   only if needed (step 1)
           # dockerfile: <path>                       only if needed
           # target: <stage>                          only if needed
@@ -102,7 +104,8 @@ workflow moves.
 
 ### 6 · Check your work
 
-- Run `circleci config validate` in the repo if the CLI is installed.
+- Run `circleci config validate .circleci/config.yml --org e45370fa-3c48-4743-84a3-6a6530e05ac9`
+  in the repo if the CLI is installed (the private orb only resolves with `--org`).
   Otherwise, at least check the YAML parses.
 - Run `git status` and confirm exactly two changes: the new `.circleci/config.yml`
   and the renamed workflow.

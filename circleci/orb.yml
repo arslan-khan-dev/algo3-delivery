@@ -8,10 +8,12 @@
 #       jobs:
 #         - algo3/deliver:
 #             app: <app>
+#             # validate-image: <image>       optional: run the tests in this image
+#             # validate-command: "<command>" optional: tests, run on staging before the build
 #             context: algo3-deploy
 #             filters: { branches: { only: [staging, main] } }
 #
-#   push to staging → build the image once (:<sha> on GHCR), scan it, deploy staging
+#   push to staging → test (if configured) → build the image once (:<sha> on GHCR), scan it, deploy staging
 #   push to main    → no rebuild: the image of the staging commit with the same
 #                     code is deployed to production
 #
@@ -45,6 +47,14 @@ jobs:
         description: Dockerfile stage to build (empty builds the last stage)
         type: string
         default: ""
+      validate-image:
+        description: Run validate-command inside this image (node:22, oven/bun:1.3, python:3.12...). The repo is copied to /src.
+        type: string
+        default: ""
+      validate-command:
+        description: Lint/test/typecheck command, run on staging before the build; empty skips it
+        type: string
+        default: ""
     machine:
       image: ubuntu-2404:current
     environment:
@@ -52,6 +62,8 @@ jobs:
       IMAGE_PARAM: << parameters.image >>
       DOCKERFILE: << parameters.dockerfile >>
       TARGET_STAGE: << parameters.target >>
+      VALIDATE_IMAGE: << parameters.validate-image >>
+      VALIDATE_COMMAND: << parameters.validate-command >>
     steps:
       - checkout
       - run:
@@ -66,6 +78,22 @@ jobs:
             esac
             echo "export IMAGE=$IMAGE ENV_NAME=$ENV_NAME" >> "$BASH_ENV"
             echo "$APP → $ENV_NAME, image $IMAGE"
+      - run:
+          name: Test
+          command: |
+            if [[ "$ENV_NAME" != staging || -z "$VALIDATE_COMMAND" ]]; then
+              echo "No tests to run for $ENV_NAME (validate-command is empty or this is not staging)"
+              exit 0
+            fi
+            # Scratch copy: node_modules, build output and root-owned files from
+            # the tests never reach the docker build context.
+            src="$(mktemp -d)"
+            cp -a . "$src"
+            if [[ -n "$VALIDATE_IMAGE" ]]; then
+              docker run --rm -v "$src:/src" -w /src -e CI=true "$VALIDATE_IMAGE" sh -ec "$VALIDATE_COMMAND"
+            else
+              (cd "$src" && bash -euo pipefail -c "$VALIDATE_COMMAND")
+            fi
       - run:
           name: Log in to GHCR
           command: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin

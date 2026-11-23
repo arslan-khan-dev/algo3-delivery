@@ -11,5 +11,7 @@ workflows:
     jobs:
       - algo3/deliver:
           app: my-app                  # registered on the server: server/apps/my-app/
+          # validate-image: <image>       # optional: tests run in this image (node:22...)
+          # validate-command: "<command>" # optional: tests, run on staging before the build
           context: algo3-deploy
           filters: { branches: { only: [staging, main] } }

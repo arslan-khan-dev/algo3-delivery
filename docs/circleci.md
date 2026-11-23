@@ -29,8 +29,8 @@ push main    ─► find the staging commit with the same code ─► deploy its
   publish a new orb version.
 
 Not covered yet: repos that ship several services
-(`examples/deliver-multi-service.yml`), `tree-path` monorepos, and running
-tests (`validate-command`). Those repos stay on GitHub Actions for now.
+(`examples/deliver-multi-service.yml`) and `tree-path` monorepos. Those repos
+stay on GitHub Actions for now.
 
 ## What is already set up
 
@@ -78,7 +78,9 @@ An agent can do steps 2–3: point it at `docs/circleci-agent.md` and the repo's
    variables are needed.
 2. **Config:** copy `examples/circleci-config.yml` to `<repo>/.circleci/config.yml`
    and set `app:`. Add `image: ghcr.io/arslan-khan-dev/<name>` only when the
-   image name is not the repo name (biruno → `biruno-ai`).
+   image name is not the repo name (biruno → `biruno-ai`). If the GitHub
+   workflow has `validate-image` / `validate-command`, copy both into the
+   config; for `node-version: <v>`, use `validate-image: node:<v>`.
 3. **Turn GitHub Actions off** without losing it:
    ```bash
    mkdir -p .github/workflows-disabled
