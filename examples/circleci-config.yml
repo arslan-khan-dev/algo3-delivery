@@ -1,0 +1,15 @@
+# Copy to <repo>/.circleci/config.yml and set the app name. Everything else is
+# in the algo3 orb (circleci/orb.yml in algo3-delivery) and the CircleCI
+# context algo3-deploy. See docs/circleci.md.
+version: 2.1
+
+orbs:
+  algo3: algo3/delivery@1
+
+workflows:
+  deliver:
+    jobs:
+      - algo3/deliver:
+          app: my-app                  # registered on the server: server/apps/my-app/
+          context: algo3-deploy
+          filters: { branches: { only: [staging, main] } }

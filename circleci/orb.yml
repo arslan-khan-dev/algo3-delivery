@@ -1,0 +1,114 @@
+# algo3 delivery for CircleCI: the CircleCI twin of .github/workflows/deploy-app.yml.
+# Published as a private orb (see docs/circleci.md). A product repo uses it with:
+#
+#   orbs:
+#     algo3: algo3/delivery@1
+#   workflows:
+#     deliver:
+#       jobs:
+#         - algo3/deliver:
+#             app: <app>
+#             context: algo3-deploy
+#             filters: { branches: { only: [staging, main] } }
+#
+#   push to staging → build the image once (:<sha> on GHCR), scan it, deploy staging
+#   push to main    → no rebuild: the image of the staging commit with the same
+#                     code is deployed to production
+#
+# The server enforces the important rules itself: production only accepts a
+# release (sha AND digest) that was live on staging (PROMOTE_FROM=staging), and
+# a deploy only succeeds once the public URL serves the new release.
+#
+# Settings come from the CircleCI context `algo3-deploy`:
+#   GHCR_USER, GHCR_TOKEN           GitHub user + classic token with write:packages
+#   VPS_HOST, VPS_KNOWN_HOSTS       server address, its `ssh-keyscan -t ed25519` line
+#   DEPLOY_SSH_KEY_STAGING_B64      the --any-app deploy keys, base64 on one line
+#   DEPLOY_SSH_KEY_PRODUCTION_B64
+version: 2.1
+description: algo3 delivery - build once on staging, promote the same image to production.
+
+jobs:
+  deliver:
+    description: Deliver one app. Run it on the staging and main branches only.
+    parameters:
+      app:
+        description: Registered app name on the server (/etc/algo3/apps/<app>)
+        type: string
+      image:
+        description: Image without tag. Empty means ghcr.io/<owner>/<repo>.
+        type: string
+        default: ""
+      dockerfile:
+        type: string
+        default: Dockerfile
+      target:
+        description: Dockerfile stage to build (empty builds the last stage)
+        type: string
+        default: ""
+    machine:
+      image: ubuntu-2404:current
+    environment:
+      APP: << parameters.app >>
+      IMAGE_PARAM: << parameters.image >>
+      DOCKERFILE: << parameters.dockerfile >>
+      TARGET_STAGE: << parameters.target >>
+    steps:
+      - checkout
+      - run:
+          name: Plan
+          command: |
+            [[ "$APP" =~ ^[a-z][a-z0-9-]{1,40}$ ]] || { echo "Invalid app name: $APP"; exit 1; }
+            IMAGE="${IMAGE_PARAM:-ghcr.io/${CIRCLE_PROJECT_USERNAME,,}/${CIRCLE_PROJECT_REPONAME,,}}"
+            case "$CIRCLE_BRANCH" in
+              staging) ENV_NAME=staging ;;
+              main)    ENV_NAME=production ;;
+              *) echo "Delivery runs only on staging and main (got $CIRCLE_BRANCH)"; exit 1 ;;
+            esac
+            echo "export IMAGE=$IMAGE ENV_NAME=$ENV_NAME" >> "$BASH_ENV"
+            echo "$APP → $ENV_NAME, image $IMAGE"
+      - run:
+          name: Log in to GHCR
+          command: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+      - run:
+          name: Pick the release (staging builds it, production finds staging's)
+          command: |
+            digest_of() { docker buildx imagetools inspect "$IMAGE:$1" --format '{{json .Manifest}}' | jq -r .digest; }
+            if [[ "$ENV_NAME" == staging ]]; then
+              SHA="$CIRCLE_SHA1"
+              # :<sha> always means one build: a rerun reuses it.
+              if ! docker buildx imagetools inspect "$IMAGE:$SHA" >/dev/null 2>&1; then
+                docker buildx build --push --provenance=false \
+                  -f "$DOCKERFILE" ${TARGET_STAGE:+--target "$TARGET_STAGE"} \
+                  --build-arg RELEASE_SHA="$SHA" -t "$IMAGE:$SHA" .
+              fi
+            else
+              git fetch -q origin staging
+              tree="$(git rev-parse 'HEAD^{tree}')"
+              SHA="$(git log -50 --format='%H %T' FETCH_HEAD | awk -v t="$tree" '$2 == t { print $1; exit }')"
+              [[ -n "$SHA" ]] || { echo "This code was never on staging. Merge it to staging first."; exit 1; }
+            fi
+            DIGEST="$(digest_of "$SHA")"
+            [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "No image digest for $IMAGE:$SHA"; exit 1; }
+            echo "export SHA=$SHA DIGEST=$DIGEST" >> "$BASH_ENV"
+            echo "Release $SHA ($DIGEST)"
+      - run:
+          name: Scan the image (fixable CRITICAL vulnerabilities fail staging)
+          command: |
+            [[ "$ENV_NAME" == staging ]] || { echo "Production reuses staging's scanned image"; exit 0; }
+            docker pull --quiet "$IMAGE@$DIGEST" >/dev/null
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.76.1 \
+              image --quiet --ignore-unfixed --exit-code 1 --severity CRITICAL "$IMAGE@$DIGEST"
+      - run:
+          name: Deploy through the server's forced command
+          command: |
+            key_var="DEPLOY_SSH_KEY_${ENV_NAME^^}_B64"
+            [[ -n "${!key_var}" && -n "$VPS_HOST" && -n "$VPS_KNOWN_HOSTS" ]] ||
+              { echo "$key_var, VPS_HOST and VPS_KNOWN_HOSTS must be set (context algo3-deploy)"; exit 1; }
+            mkdir -p ~/.ssh
+            echo "${!key_var}" | base64 -d > ~/.ssh/deploy_key
+            chmod 600 ~/.ssh/deploy_key
+            echo "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+            printf 'app=%s\n%s\n%s\n' "$APP" "$SHA" "$DIGEST" |
+              ssh -T -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes \
+                  -o StrictHostKeyChecking=yes -o ServerAliveInterval=15 \
+                  "algo3-deploy@$VPS_HOST"
